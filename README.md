@@ -8,7 +8,7 @@ Requires ReShade 6.8 with add-on support and an NVIDIA GPU. Download the zip fro
 
 DLSS 5 also needs `nvngx_dlssnr.dll` next to `ffxiv_dx11.exe`. The game does not ship it. Without it, DLSS 5 stays unavailable and everything else works.
 
-Settings are saved in `ReShade.ini` under `[FFXIV_DLSS_FORGE]`. The log is `ffxiv-dlss-forge.log` beside the add-on.
+This is a Linux-first implementation (Wayland - enabled in XIVLauncher as well), Windows is untested atm.
 
 ## DLSS
 
