@@ -644,7 +644,7 @@ namespace
 				c.per_pass = chaining == 0;
 				changed = true;
 			}
-			ImGui::SetItemTooltip("Per pass: each pass's change is limited and applied to the image, which is encoded again for the next pass; one GPU submission per pass. Single transfer: each pass reads the previous pass's raw answer and the limits apply once to the total; one submission per frame.");
+			ImGui::SetItemTooltip("Per pass: limits each pass. Single transfer: limits the total once, faster.");
 		}
 		if (ImGui::BeginTabBar("##passes", ImGuiTabBarFlags_FittingPolicyScroll))
 		{
@@ -699,7 +699,7 @@ namespace
 			if (!st.hdr)
 			{
 				changed |= ImGui::Checkbox("sRGB decode", &c.codec);
-				ImGui::SetItemTooltip("Decodes the frame from sRGB to linear, encodes it again for the model, and applies the model's change as brightness and colour gains in stops. Off hands the model the frame as stored.");
+				ImGui::SetItemTooltip("Decodes the frame to linear and limits the model's change. Off: the model gets the frame as stored.");
 			}
 			if (!st.hdr && c.codec)
 			{
