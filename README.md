@@ -24,7 +24,7 @@ Set FFXIV to Borderless Windowed and choose a desktop resolution above the monit
 
 DLSS 5 runs on the DLSS output before the UI is drawn. Each pass has its own model, network, intensity, structure and tone; later passes inherit the first until edited. Automask and developer masking set how characters, near and far scenery are affected.
 
-Linear codec, on by default, prepares FFXIV's display-referred frame for the model and limits its brightness and colour changes. Pass chaining selects whether each pass is limited on its own or the result once.
+sRGB decode, on by default, decodes FFXIV's frame to linear for the model and limits its brightness and colour changes. Pass chaining selects whether each pass is limited on its own or the result once.
 
 Side-by-side and wipe comparisons show the change against the original frame. The on-screen indicator shows model resolution, pass count and GPU time.
 

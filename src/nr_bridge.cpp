@@ -359,7 +359,7 @@ namespace
 		ID3D11UnorderedAccessView *work_uav[2] = {};
 		unsigned int work_w = 0, work_h = 0;
 		DXGI_FORMAT work_format = DXGI_FORMAT_UNKNOWN;
-		// Linear codec: the applied divisor and whether it is moving (R32_FLOAT, 2 x 1)
+		// sRGB decode: the applied divisor and whether it is moving (R32_FLOAT, 2 x 1)
 		ID3D11Texture2D *meter = nullptr;
 		ID3D11ShaderResourceView *meter_srv = nullptr;
 		ID3D11UnorderedAccessView *meter_uav = nullptr;
@@ -1299,7 +1299,7 @@ namespace
 		return true;
 	}
 
-	// The linear codec's divisor state, cleared to zero so the first frame snaps to its measurement
+	// The sRGB decode divisor state, cleared to zero so the first frame snaps to its measurement
 	bool ensure_meter()
 	{
 		if (g.meter != nullptr)
@@ -2056,7 +2056,7 @@ bool forge::nr::run(const frame &in, const config &c)
 	}
 
 	// 2. The model passes. Chained: each pass reads the previous pass's raw answer in one submission, and the
-	// resolve composes the last answer. Per pass (linear codec, more than one pass): after each pass the game
+	// resolve composes the last answer. Per pass (sRGB decode, more than one pass): after each pass the game
 	// context applies that pass's transfer to the running image and encodes the result again, with the frame's
 	// divisor, as the next pass's input; every pass is its own submission.
 	// Prepared motion is in unjittered UV units; NGX scales it into model-grid pixels.

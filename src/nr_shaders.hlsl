@@ -2,7 +2,7 @@
 // d3dcompiler_47 into nr_shaders.h. Wine's built-in compiler drops texture loads in the resolve.
 //
 // The composition: two-branch luminance ratio, OkLab hue correction, AP1 gamut compression, highlight
-// guard, skin/environment split, compare and debug views, and the linear codec's ratio transfer.
+// guard, skin/environment split, compare and debug views, and the sRGB decode's ratio transfer.
 cbuffer params : register(b0)
 {
 	uint4 g_rect;      // image base x, base y, width, height
@@ -19,8 +19,8 @@ cbuffer params : register(b0)
 	uint4 g_motion_size; // source motion w, motion h, 0, 0
 	float4 g_jitter; // raster jitter UV, correction from jittered to unjittered motion UV
 	float4 g_motion_scale; // raw motion to UV scale x, y, 0, 0
-	float4 g_codec;        // linear codec: brightness bound (stops), colour bound (stops), divisor rise, divisor fall (stops this frame)
-	uint4 g_codec_state;   // linear codec: snap the divisor to this frame's measurement, 0, 0, 0
+	float4 g_codec;        // sRGB decode: brightness bound (stops), colour bound (stops), divisor rise, divisor fall (stops this frame)
+	uint4 g_codec_state;   // sRGB decode: snap the divisor to this frame's measurement, 0, 0, 0
 };
 
 // Each kernel is compiled on its own with only its resources declared, numbered from 0. Wine's
@@ -65,7 +65,7 @@ RWTexture2D<float4> o_image : register(u0);
 
 static const float3 kLuma = float3(0.2126, 0.7152, 0.0722);
 
-// g_modes.x: 0 linear HDR (IsHDR), 1 display-referred frame edited directly, 2 display-referred frame through the linear codec
+// g_modes.x: 0 linear HDR (IsHDR), 1 display-referred frame edited directly, 2 display-referred frame through the sRGB decode
 bool passthrough() { return g_modes.x == 1; }
 bool codec() { return g_modes.x == 2; }
 // The model's input and output are shown as stored (debug views) in both display-referred modes
@@ -204,7 +204,7 @@ float3 Encode(float3 frame)
 	return LinearToSrgb(SoftKnee(frame / white_point()));
 }
 
-// The linear codec for float frames without IsHDR: the frame is read as linear light and divided by the
+// The sRGB decode for float frames without IsHDR: the frame is read as linear light and divided by the
 // metered divisor; its peak channel gains a small toe (at most 0.014) and rolls off above 0.75, and the
 // result is sRGB-encoded. FFXIV's frame is already gamma-encoded, so the model sees a brighter, flatter
 // picture than the game shows.

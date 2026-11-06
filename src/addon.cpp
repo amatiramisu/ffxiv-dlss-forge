@@ -635,6 +635,17 @@ namespace
 			c.passes = c.pass_count();
 			changed = true;
 		}
+		if (c.pass_count() > 1 && !st.hdr && c.codec)
+		{
+			int chaining = c.per_pass ? 0 : 1;
+			ImGui::SetNextItemWidth(nr_width);
+			if (ImGui::Combo("Pass chaining", &chaining, "Per pass (quality)\0Single transfer (fast)\0"))
+			{
+				c.per_pass = chaining == 0;
+				changed = true;
+			}
+			ImGui::SetItemTooltip("Per pass: each pass's change is limited and applied to the image, which is encoded again for the next pass; one GPU submission per pass. Single transfer: each pass reads the previous pass's raw answer and the limits apply once to the total; one submission per frame.");
+		}
 		if (ImGui::BeginTabBar("##passes", ImGuiTabBarFlags_FittingPolicyScroll))
 		{
 			for (unsigned int i = 0; i < c.pass_count(); ++i)
@@ -683,19 +694,12 @@ namespace
 		ImGui::SetItemTooltip("Edge width of the bands, in octaves of distance.");
 		ImGui::EndDisabled();
 
-		if (ImGui::TreeNode("Composition"))
+		if (ImGui::TreeNode("Decode and limits"))
 		{
-			ImGui::SetNextItemWidth(nr_width);
-			changed |= snap_slider("Detail strength", &c.detail, 0.0f, 2.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
-			ImGui::SetItemTooltip("Amount of model change in the frame. 0 gives the DLSS frame.");
-			ImGui::SetNextItemWidth(nr_width);
-			changed |= snap_slider("Colour strength", &c.colour, 0.0f, 4.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
-			ImGui::SetItemTooltip("0: game colours. 1: model colours. More than 1: stronger model colours.");
-			ImGui::SetNextItemWidth(nr_width);
 			if (!st.hdr)
 			{
-				changed |= ImGui::Checkbox("Linear codec", &c.codec);
-				ImGui::SetItemTooltip("The model sees the frame as linear light, brightened by sRGB encoding, and its change returns as a brightness and colour gain in stops. Off hands the model the frame as stored.");
+				changed |= ImGui::Checkbox("sRGB decode", &c.codec);
+				ImGui::SetItemTooltip("Decodes the frame from sRGB to linear, encodes it again for the model, and applies the model's change as brightness and colour gains in stops. Off hands the model the frame as stored.");
 			}
 			if (!st.hdr && c.codec)
 			{
@@ -705,14 +709,6 @@ namespace
 				ImGui::SetNextItemWidth(nr_width);
 				changed |= snap_slider("Colour limit", &c.codec_chroma, 0.0f, 2.0f, "%.2f stops", ImGuiSliderFlags_AlwaysClamp, 0.25f);
 				ImGui::SetItemTooltip("Largest colour change of a channel relative to its brightness change, in stops.");
-				int chaining = c.per_pass ? 0 : 1;
-				ImGui::SetNextItemWidth(nr_width);
-				if (ImGui::Combo("Pass chaining", &chaining, "Per pass (quality)\0Single transfer (fast)\0"))
-				{
-					c.per_pass = chaining == 0;
-					changed = true;
-				}
-				ImGui::SetItemTooltip("With more than one pass. Per pass: each pass's change is limited and applied to the image, which is encoded again for the next pass; one GPU submission per pass. Single transfer: each pass reads the previous pass's raw answer and the limits apply once to the total; one submission per frame.");
 			}
 			else
 			{
@@ -720,6 +716,23 @@ namespace
 				changed |= snap_slider("Highlight guard", &c.guard, 1.0f, 8.0f, "%.1fx", ImGuiSliderFlags_AlwaysClamp, 0.1f);
 				ImGui::SetItemTooltip("Maximum brightness change of a pixel, as a factor.");
 			}
+			if (st.hdr)
+			{
+				ImGui::SetNextItemWidth(nr_width);
+				changed |= ImGui::SliderFloat("Paper white", &c.paper_white, 0.1f, 16.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp | ImGuiSliderFlags_Logarithmic);
+				ImGui::SetItemTooltip("The scene value that the model shows as white.");
+			}
+			ImGui::TreePop();
+		}
+
+		if (ImGui::TreeNode("Composition"))
+		{
+			ImGui::SetNextItemWidth(nr_width);
+			changed |= snap_slider("Detail strength", &c.detail, 0.0f, 2.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+			ImGui::SetItemTooltip("Amount of model change in the frame. 0 gives the DLSS frame.");
+			ImGui::SetNextItemWidth(nr_width);
+			changed |= snap_slider("Colour strength", &c.colour, 0.0f, 4.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+			ImGui::SetItemTooltip("0: game colours. 1: model colours. More than 1: stronger model colours.");
 			float pct = c.work_scale * 100.0f;
 			ImGui::SetNextItemWidth(nr_width);
 			if (ImGui::SliderFloat("Model resolution", &pct, 25.0f, 200.0f, "%.0f %%", ImGuiSliderFlags_AlwaysClamp))
@@ -728,12 +741,6 @@ namespace
 				changed = true;
 			}
 			ImGui::SetItemTooltip("Percentage of the frame resolution.");
-			if (st.hdr)
-			{
-				ImGui::SetNextItemWidth(nr_width);
-				changed |= ImGui::SliderFloat("Paper white", &c.paper_white, 0.1f, 16.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp | ImGuiSliderFlags_Logarithmic);
-				ImGui::SetItemTooltip("The scene value that the model shows as white.");
-			}
 			changed |= ImGui::Checkbox("Skin-coloured pixels", &c.regions);
 			ImGui::SetItemTooltip("Separate strengths for pixels with skin colour. The test uses only colour. Wood, sand, brass and warm cloth also pass.");
 			if (c.regions)

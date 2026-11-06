@@ -88,12 +88,12 @@ namespace forge::nr
 		float colour = 1.0f;      // 0 keeps the game's colour, 1 the model's, above 1 more saturated, 0 .. 4
 		float guard = 2.0f;       // highlight guard: largest brightening/darkening factor, 1 .. 8
 		float paper_white = 1.0f; // HDR inputs only: scene value shown to the model as white
-		// Display-referred frames (no IsHDR): 1 runs them through the linear codec (metered divisor,
+		// Display-referred frames (no IsHDR): 1 runs them through the sRGB decode (metered divisor,
 		// sRGB-encoded model input, ratio transfer in stops); 0 hands the frame to the model as stored
 		bool codec = true;
-		float codec_luma = 2.0f;   // linear codec: largest brightness change, in stops, 0 .. 4
-		float codec_chroma = 1.0f; // linear codec: largest colour change around it, in stops, 0 .. 2
-		// Linear codec with several passes: true bounds and re-encodes each pass (one submission per pass),
+		float codec_luma = 2.0f;   // sRGB decode: largest brightness change, in stops, 0 .. 4
+		float codec_chroma = 1.0f; // sRGB decode: largest colour change around it, in stops, 0 .. 2
+		// sRGB decode with several passes: true bounds and re-encodes each pass (one submission per pass),
 		// false chains the raw model outputs and bounds the result once (one submission per frame)
 		bool per_pass = true;
 
