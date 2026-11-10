@@ -52,6 +52,10 @@ namespace
 	// ControlMask: red weights Intensity, green multiplies tone, blue multiplies structure.
 	constexpr DXGI_FORMAT mask_format = DXGI_FORMAT_R8G8B8A8_UNORM;
 
+	// Packed motion vectors, in the format of the game's own vectors. Windows rejects a shared R32G32_FLOAT texture
+	// (E_INVALIDARG). A shared R16G16_FLOAT texture passed the same test, with the D3D12 import.
+	constexpr DXGI_FORMAT motion_format = DXGI_FORMAT_R16G16_FLOAT;
+
 	uint16_t to_half(float f)
 	{
 		uint32_t x;
@@ -1208,24 +1212,32 @@ namespace
 		td.Usage = D3D11_USAGE_DEFAULT;
 		td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
 		td.MiscFlags = D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
-		bool ok = g.v.on ? vk_create_tex(t, w, h, fmt) : SUCCEEDED(g.dev11->CreateTexture2D(&td, nullptr, &t.t11));
-		ok = ok && SUCCEEDED(g.dev11->CreateShaderResourceView(t.t11, nullptr, &t.srv)) &&
-			SUCCEEDED(g.dev11->CreateUnorderedAccessView(t.t11, nullptr, &t.uav));
-		if (ok && !g.v.on)
+		// The log names the first step that fails and gives its HRESULT
+		const char *step = g.v.on ? "Vulkan image" : "CreateTexture2D";
+		HRESULT hr = g.v.on ? (vk_create_tex(t, w, h, fmt) ? S_OK : E_FAIL) : g.dev11->CreateTexture2D(&td, nullptr, &t.t11);
+		const auto next = [&](const char *name) { step = SUCCEEDED(hr) ? name : step; return SUCCEEDED(hr); };
+		if (next("CreateShaderResourceView"))
+			hr = g.dev11->CreateShaderResourceView(t.t11, nullptr, &t.srv);
+		if (next("CreateUnorderedAccessView"))
+			hr = g.dev11->CreateUnorderedAccessView(t.t11, nullptr, &t.uav);
+		if (!g.v.on)
 		{
 			HANDLE handle = nullptr;
 			IDXGIResource1 *res = nullptr;
-			ok = SUCCEEDED(t.t11->QueryInterface(__uuidof(IDXGIResource1), reinterpret_cast<void **>(&res))) &&
-				SUCCEEDED(res->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, nullptr, &handle)) &&
-				SUCCEEDED(g.dev12->OpenSharedHandle(handle, __uuidof(ID3D12Resource), reinterpret_cast<void **>(&t.t12)));
+			if (next("IDXGIResource1"))
+				hr = t.t11->QueryInterface(__uuidof(IDXGIResource1), reinterpret_cast<void **>(&res));
+			if (next("CreateSharedHandle"))
+				hr = res->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, nullptr, &handle);
+			if (next("OpenSharedHandle"))
+				hr = g.dev12->OpenSharedHandle(handle, __uuidof(ID3D12Resource), reinterpret_cast<void **>(&t.t12));
 			safe_release(res);
 			if (handle != nullptr)
 				CloseHandle(handle);
 		}
-		if (!ok)
+		if (FAILED(hr))
 		{
 			t.release();
-			fail("shared %s texture %ux%u could not be created", what, w, h);
+			fail("shared %s texture %ux%u format %d: %s failed (0x%08lX)", what, w, h, static_cast<int>(fmt), step, static_cast<unsigned long>(hr));
 			return false;
 		}
 		t.w = w;
@@ -1972,7 +1984,7 @@ bool forge::nr::run(const frame &in, const config &c)
 		!ensure_shared(g.model[0], ww, wh, DXGI_FORMAT_R16G16B16A16_FLOAT, "model output") ||
 		(passes > 1 && !ensure_shared(g.model[1], ww, wh, DXGI_FORMAT_R16G16B16A16_FLOAT, "second model output")) ||
 		(f.depth != nullptr && !ensure_shared(g.depth, f.guide_w, f.guide_h, DXGI_FORMAT_R32_FLOAT, "depth")) ||
-		(f.motion != nullptr && !ensure_shared(g.motion, ww, wh, DXGI_FORMAT_R32G32_FLOAT, "motion vector")) ||
+		(f.motion != nullptr && !ensure_shared(g.motion, ww, wh, motion_format, "motion vector")) ||
 		(mask_on && !ensure_shared(g.mask, mw, mh, mf, "control mask")) ||
 		(show_groups && !ensure_groups(ww, wh)) ||
 		!ensure_keep(f.w, f.h, image_desc.Format))
