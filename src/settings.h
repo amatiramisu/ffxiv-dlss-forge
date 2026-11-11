@@ -1,6 +1,7 @@
 #pragma once
 
 #include "nr_config.h"
+#include "dsr_control.h"
 #include <cstdint>
 
 namespace forge
@@ -28,12 +29,24 @@ namespace forge
 		unsigned int preset = 11;    // NGX preset value; 0 = game/NVIDIA default, 11 = K
 		exposure_mode exposure = exposure_mode::game;
 		unsigned int desktop_w = 0, desktop_h = 0; // desktop mode to run the game on; 0 x 0 = the display's registry mode
+		unsigned int dsr_w = 0, dsr_h = 0, dldsr_w = 0, dldsr_h = 0; // last mode chosen with each filter
+		unsigned int dsr_method = WINE_DSR_AUTO;
+		int dsr_smoothness = -1, dldsr_smoothness = -1; // -1 = filter default, see filter_smoothness()
 		bool indicator = false;      // NVIDIA DLSS on-screen indicator
 		bool motion_capture = false; // session-only NGX metadata and GPU measurements
 		int motion_capture_test = 0;
 
 		nr::config nr;               // DLSS 5 neural rendering; applied per frame, never re-creates the DLSS feature
 	};
+
+	// Smoothness a filter runs with. The DSR default is the Wine startup value, the DL-DSR default is 33 %.
+	inline int filter_smoothness(const settings &s, unsigned int method, int startup)
+	{
+		const int stored = method == WINE_DSR_NEURAL ? s.dldsr_smoothness : s.dsr_smoothness;
+		if (stored >= 0) return stored;
+		if (method == WINE_DSR_NEURAL) return 33;
+		return startup >= 0 ? startup : 0;
+	}
 
 	// The game runs under Wine (the prefix has HKCU\Software\Wine); desktop modes are offered only there.
 	bool wine();

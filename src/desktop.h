@@ -1,6 +1,7 @@
 #pragma once
 
 #include <windows.h>
+#include "dsr_control.h"
 
 // DSR desktop resolution. The display lists modes above its native one (NVIDIA DSR on Windows,
 // proton-wineland-ffxiv under Wine); the selected mode is set with ChangeDisplaySettingsEx and the borderless
@@ -19,7 +20,13 @@ namespace forge::desktop
 	{
 		bool attached = false;      // game window known
 		wchar_t device[32] = {};    // display device the game window is on
-		mode native;                // the display's registry mode
+		mode native;                // physical display mode, or the registry fallback
+		mode original;              // registry mode to restore
+		bool physical = false;
+		bool dsr_control = false;
+		wine_dsr_control dsr = {};
+		DWORD dsr_error = 0;
+		int dsr_startup_smoothness = -1; // Wine's value before Forge changed it
 		mode current;               // the mode the desktop runs
 		unsigned int count = 0;     // native and every larger mode, ascending
 		mode modes[max_modes];
@@ -45,4 +52,7 @@ namespace forge::desktop
 	// Back to the registry mode after a switch
 	void release();
 	status get();
+	// Match NVIDIA's rounded per-axis scales against the physical display.
+	bool neural_mode(const mode &m, const mode &native);
+	const char *dsr_reason(unsigned int reason);
 }

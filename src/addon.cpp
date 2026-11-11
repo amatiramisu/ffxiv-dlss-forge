@@ -10,7 +10,6 @@
 #include "ngx_hook.h"
 #include "nr_bridge.h"
 #include "nr_dll.h"
-#include "overlay_text.h"
 #include "settings.h"
 
 #include <cfloat>
@@ -218,6 +217,13 @@ namespace
 			s.exposure = forge::exposure_mode::game;
 		s.desktop_w = static_cast<unsigned int>(read_int("DesktopWidth", static_cast<int>(s.desktop_w)));
 		s.desktop_h = static_cast<unsigned int>(read_int("DesktopHeight", static_cast<int>(s.desktop_h)));
+		s.dsr_method = static_cast<unsigned int>(read_int("DsrMethod", s.dsr_method));
+		s.dsr_smoothness = read_int("DsrSmoothness", s.dsr_smoothness);
+		s.dldsr_smoothness = read_int("DldsrSmoothness", s.dldsr_smoothness);
+		s.dsr_w = static_cast<unsigned int>(read_int("DsrWidth", static_cast<int>(s.dsr_w)));
+		s.dsr_h = static_cast<unsigned int>(read_int("DsrHeight", static_cast<int>(s.dsr_h)));
+		s.dldsr_w = static_cast<unsigned int>(read_int("DldsrWidth", static_cast<int>(s.dldsr_w)));
+		s.dldsr_h = static_cast<unsigned int>(read_int("DldsrHeight", static_cast<int>(s.dldsr_h)));
 		s.indicator = read_int("Indicator", s.indicator ? 1 : 0) != 0;
 		load_nr(s.nr);
 		forge::set_settings(s);
@@ -233,6 +239,13 @@ namespace
 		reshade::set_config_value(nullptr, section, "Exposure", static_cast<int>(s.exposure));
 		reshade::set_config_value(nullptr, section, "DesktopWidth", static_cast<int>(s.desktop_w));
 		reshade::set_config_value(nullptr, section, "DesktopHeight", static_cast<int>(s.desktop_h));
+		reshade::set_config_value(nullptr, section, "DsrMethod", static_cast<int>(s.dsr_method));
+		reshade::set_config_value(nullptr, section, "DsrSmoothness", s.dsr_smoothness);
+		reshade::set_config_value(nullptr, section, "DldsrSmoothness", s.dldsr_smoothness);
+		reshade::set_config_value(nullptr, section, "DsrWidth", static_cast<int>(s.dsr_w));
+		reshade::set_config_value(nullptr, section, "DsrHeight", static_cast<int>(s.dsr_h));
+		reshade::set_config_value(nullptr, section, "DldsrWidth", static_cast<int>(s.dldsr_w));
+		reshade::set_config_value(nullptr, section, "DldsrHeight", static_cast<int>(s.dldsr_h));
 		reshade::set_config_value(nullptr, section, "Indicator", s.indicator ? 1 : 0);
 		save_nr(s.nr);
 	}
@@ -278,33 +291,6 @@ namespace
 	constexpr ImVec4 colour_ok(0.55f, 0.9f, 0.55f, 1.0f);
 	constexpr ImVec4 colour_issue(1.0f, 0.6f, 0.35f, 1.0f);
 	constexpr float nr_width = 260.0f;
-
-	class aligned_overlay_text
-	{
-	public:
-		explicit aligned_overlay_text(ImDrawList *list) : _list(list), _first(list->VtxBuffer.Size)
-		{
-			const auto ds = forge::desktop::get();
-			if (ds.borderless && ds.native.w && ds.native.h &&
-				(ds.current.w > ds.native.w || ds.current.h > ds.native.h))
-			{
-				const auto &io = ImGui::GetIO();
-				_pixel_w = io.DisplaySize.x / ds.native.w;
-				_pixel_h = io.DisplaySize.y / ds.native.h;
-			}
-		}
-
-		~aligned_overlay_text()
-		{
-			if (_pixel_w > 1.0f || _pixel_h > 1.0f)
-				forge::overlay::align_text(*_list, _first, *ImGui::GetFontBaked(), ImGui::GetFontSize(), _pixel_w, _pixel_h);
-		}
-
-	private:
-		ImDrawList *_list;
-		int _first;
-		float _pixel_w = 1.0f, _pixel_h = 1.0f;
-	};
 
 	// SliderFloat that snaps to `step` while dragged; Ctrl+click types any value
 	bool snap_slider(const char *label, float *v, float lo, float hi, const char *format, ImGuiSliderFlags flags, float step = 0.05f)
@@ -728,90 +714,213 @@ namespace
 			changed |= ImGui::Combo("Debug view", &c.debug_view, "Off\0Model input\0Model output\0Difference x20\0", -1);
 			changed |= ImGui::Checkbox("Frame log", &c.frame_log);
 			ImGui::SetItemTooltip("Writes per-frame values to ffxiv-dlss-forge.log.");
+			if (st.ready)
+				ImGui::TextDisabled("%s, frame %u x %u, guides %u x %u%s, %s, %llu frames, %llu model builds, last 0x%08X", st.backend, st.frame_w, st.frame_h, st.guide_w, st.guide_h,
+					st.mask ? ", control mask" : "", st.hdr ? "HDR" : "display-referred", static_cast<unsigned long long>(st.frames), static_cast<unsigned long long>(st.creates), st.last_result);
 			ImGui::TreePop();
 		}
-
-		if (st.ready)
-			ImGui::TextDisabled("%s, frame %u x %u, guides %u x %u%s, %s, %llu frames, %llu model builds, last 0x%08X", st.backend, st.frame_w, st.frame_h, st.guide_w, st.guide_h,
-				st.mask ? ", control mask" : "", st.hdr ? "HDR" : "display-referred", static_cast<unsigned long long>(st.frames), static_cast<unsigned long long>(st.creates), st.last_result);
 		ImGui::EndDisabled();
 	}
 
 	void draw_desktop(forge::settings &s, bool &changed)
 	{
-		ImGui::SeparatorText("Desktop resolution");
-		const forge::desktop::status ds = forge::desktop::get();
-		// Items: the display's own mode, then every larger mode it lists; the selected size when it is listed nowhere
-		char items[forge::desktop::max_modes * 48 + 64];
-		unsigned int sizes[forge::desktop::max_modes + 2][2];
-		int count = 0, selected = 0;
-		size_t at = 0;
-		const auto add = [&](unsigned int w, unsigned int h, const char *text) {
-			const size_t len = std::strlen(text);
-			if (count >= static_cast<int>(forge::desktop::max_modes + 2) || at + len + 2 > sizeof(items))
-				return;
-			std::memcpy(items + at, text, len + 1);
-			at += len + 1;
-			sizes[count][0] = w;
-			sizes[count][1] = h;
-			if (w == s.desktop_w && h == s.desktop_h)
-				selected = count;
-			count++;
-		};
-		char text[64];
-		const bool own_selected = s.desktop_w == 0 || (s.desktop_w == ds.native.w && s.desktop_h == ds.native.h);
-		if (ds.native.w != 0)
-			snprintf(text, sizeof(text), "%u x %u (the display's own mode)", ds.native.w, ds.native.h);
+		ImGui::SeparatorText("Display supersampling");
+		const auto ds = forge::desktop::get();
+		if (ds.native.w)
+			ImGui::Text("Display  %u x %u @ %u Hz", ds.native.w, ds.native.h, ds.native.hz);
 		else
-			snprintf(text, sizeof(text), "The display's own mode");
-		add(0, 0, text);
-		if (own_selected)
-			selected = 0;
-		bool listed = own_selected;
+			ImGui::TextDisabled("Waiting for the display");
+
+		struct choice { unsigned int w = 0, h = 0; int smoothness = 0; };
+		static unsigned int method = WINE_DSR_OFF, width = 0, height = 0;
+		static choice last[WINE_DSR_NEURAL + 1]; // last choice per filter, by method
+		static int smoothness = 0;
+		static bool pending = false, smooth_active = false;
+		// Without the Wine control, the driver owns the filter and Forge only picks the desktop mode.
+		const bool live = ds.dsr_control;
+		const int startup_smoothness = ds.dsr_startup_smoothness;
+		const unsigned int selected_w = s.desktop_w ? s.desktop_w : ds.original.w;
+		const unsigned int selected_h = s.desktop_h ? s.desktop_h : ds.original.h;
+		unsigned int current_method = s.dsr_method;
+		if (current_method == WINE_DSR_AUTO)
+			current_method = !selected_w || (selected_w == ds.native.w && selected_h == ds.native.h) ? WINE_DSR_OFF :
+				ds.dsr.active_method == WINE_DSR_NEURAL ? WINE_DSR_NEURAL : WINE_DSR_GAUSSIAN;
+		const unsigned int wanted_w = current_method == WINE_DSR_OFF ? ds.native.w : selected_w;
+		const unsigned int wanted_h = current_method == WINE_DSR_OFF ? ds.native.h : selected_h;
+		const auto saved_smoothness = [&](unsigned int value) { return forge::filter_smoothness(s, value, startup_smoothness); };
+		if (!pending && !smooth_active)
+		{
+			method = current_method;
+			width = selected_w;
+			height = selected_h;
+			smoothness = saved_smoothness(method);
+			last[WINE_DSR_GAUSSIAN] = { s.dsr_w, s.dsr_h, saved_smoothness(WINE_DSR_GAUSSIAN) };
+			last[WINE_DSR_NEURAL] = { s.dldsr_w, s.dldsr_h, saved_smoothness(WINE_DSR_NEURAL) };
+		}
+		const auto remember = [&] {
+			if (method != WINE_DSR_OFF) last[method] = { width, height, smoothness };
+		};
+		const auto eligible = [&](const forge::desktop::mode &m) {
+			return m.w > ds.native.w && m.h > ds.native.h &&
+				(method != WINE_DSR_NEURAL || forge::desktop::neural_mode(m, ds.native));
+		};
+		const auto select_resolution = [&] {
+			for (unsigned int i = 0; i < ds.count; ++i)
+				if (eligible(ds.modes[i]) && ds.modes[i].w == width && ds.modes[i].h == height) return;
+			width = height = 0;
+			for (unsigned int i = 0; i < ds.count; ++i)
+			{
+				const auto &m = ds.modes[i];
+				if (!eligible(m)) continue;
+				if (!width || (m.w == (static_cast<uint64_t>(ds.native.w) * 15000 + 5000) / 10000 &&
+					m.h == (static_cast<uint64_t>(ds.native.h) * 15000 + 5000) / 10000))
+				{
+					width = m.w;
+					height = m.h;
+				}
+			}
+		};
+		const bool neural = ds.dsr_control && ds.physical && (ds.dsr.capabilities & WINE_DSR_CAP_NEURAL);
+		const char *names[] = {"Off", "DSR", "DL-DSR"};
+		for (unsigned int i = WINE_DSR_OFF; live && i <= WINE_DSR_NEURAL; ++i)
+		{
+			if (i != WINE_DSR_OFF) ImGui::SameLine();
+			ImGui::BeginDisabled(i == WINE_DSR_NEURAL && !neural);
+			if (ImGui::RadioButton(names[i - WINE_DSR_OFF], method == i))
+			{
+				remember();
+				method = i;
+				pending = true;
+				if (method == WINE_DSR_OFF)
+					smoothness = saved_smoothness(method);
+				else
+				{
+					smoothness = last[method].smoothness;
+					if (last[method].w)
+					{
+						width = last[method].w;
+						height = last[method].h;
+					}
+					select_resolution();
+				}
+			}
+			ImGui::EndDisabled();
+			if (i == WINE_DSR_NEURAL && !neural && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+				ImGui::SetTooltip("DL-DSR needs a supported NVIDIA device. Proton Wineland FFXIV releases include the assets. Source builds need user-provided assets before the game starts.");
+		}
+
+		bool valid = method == WINE_DSR_OFF, larger = false;
 		for (unsigned int i = 0; i < ds.count; ++i)
 		{
-			const forge::desktop::mode &m = ds.modes[i];
-			if (m.w == ds.native.w && m.h == ds.native.h)
-				continue;
-			const double factor = ds.native.w != 0 ? static_cast<double>(m.w) * m.h / (static_cast<double>(ds.native.w) * ds.native.h) : 0.0;
-			snprintf(text, sizeof(text), "%u x %u (DSR %.2fx)", m.w, m.h, factor);
-			add(m.w, m.h, text);
-			listed |= m.w == s.desktop_w && m.h == s.desktop_h;
+			valid |= eligible(ds.modes[i]) && ds.modes[i].w == width && ds.modes[i].h == height;
+			larger |= ds.modes[i].w > ds.native.w && ds.modes[i].h > ds.native.h;
 		}
-		if (!listed)
+		char preview[96];
+		const auto resolution_text = [&](char *text, size_t size, unsigned int w, unsigned int h) {
+			const double factor = ds.native.w && ds.native.h ? static_cast<double>(w) * h / (static_cast<double>(ds.native.w) * ds.native.h) : 0.0;
+			snprintf(text, size, "%u x %u - %.2fx", w, h, factor);
+		};
+		if (method == WINE_DSR_OFF) snprintf(preview, sizeof(preview), "Native");
+		else
 		{
-			snprintf(text, sizeof(text), "%u x %u (absent from the display's list)", s.desktop_w, s.desktop_h);
-			add(s.desktop_w, s.desktop_h, text);
+			resolution_text(preview, sizeof(preview), width, height);
+			if (!valid) std::strcat(preview, " (unavailable)");
 		}
-		items[at] = 0;
+		ImGui::BeginDisabled(live && method == WINE_DSR_OFF);
 		ImGui::SetNextItemWidth(420.0f);
-		if (ImGui::Combo("Desktop mode", &selected, items, -1))
+		if (ImGui::BeginCombo("Game output", preview))
 		{
-			s.desktop_w = sizes[selected][0];
-			s.desktop_h = sizes[selected][1];
-			changed = true;
+			if (!live && ImGui::Selectable("Native", method == WINE_DSR_OFF))
+			{
+				method = WINE_DSR_OFF;
+				valid = true;
+				pending = true;
+			}
+			for (unsigned int i = 0; i < ds.count; ++i)
+			{
+				const auto &m = ds.modes[i];
+				if (!eligible(m)) continue;
+				char label[96];
+				resolution_text(label, sizeof(label), m.w, m.h);
+				if (ImGui::Selectable(label, m.w == width && m.h == height))
+				{
+					if (!live) method = WINE_DSR_GAUSSIAN;
+					width = m.w;
+					height = m.h;
+					valid = true;
+					pending = true;
+				}
+			}
+			ImGui::EndCombo();
 		}
-		ImGui::SetItemTooltip("Modes from the display mode list. Set the game to Borderless Windowed.");
+		ImGui::EndDisabled();
+		ImGui::SetItemTooltip("Pixel-count factors of the physical display. The game uses Borderless Windowed mode.");
 
-		if (!ds.attached)
-			ImGui::TextDisabled("Waiting for the game's swapchain");
-		else if (ds.count <= 1 && !ds.switched)
-			ImGui::TextDisabled("%ls lists no mode above %u x %u", ds.device, ds.native.w, ds.native.h);
-		if (ds.attached && ds.current.w != 0)
+		smooth_active = false;
+		if (live)
 		{
-			if (!own_selected && (ds.current.w != s.desktop_w || ds.current.h != s.desktop_h))
-				ImGui::TextDisabled("Desktop %u x %u, switching to %u x %u", ds.current.w, ds.current.h, s.desktop_w, s.desktop_h);
-			else if (ds.switched && !ds.borderless)
-				ImGui::TextColored(colour_issue, "Desktop %u x %u. Set Screen Mode to Borderless Windowed (System Configuration > Display Settings).", ds.current.w, ds.current.h);
-			else if (ds.switched && (ds.buffer_w != ds.current.w || ds.buffer_h != ds.current.h))
-				ImGui::TextDisabled("Desktop %u x %u, game window %u x %u, buffer %u x %u", ds.current.w, ds.current.h, ds.client_w, ds.client_h, ds.buffer_w, ds.buffer_h);
-			else if (ds.switched)
-				ImGui::TextColored(colour_ok, "Desktop %u x %u @ %u Hz, game renders %u x %u", ds.current.w, ds.current.h, ds.current.hz, ds.buffer_w, ds.buffer_h);
-			else
-				ImGui::TextDisabled("Desktop %u x %u @ %u Hz, game renders %u x %u", ds.current.w, ds.current.h, ds.current.hz, ds.buffer_w, ds.buffer_h);
+			ImGui::BeginDisabled(method == WINE_DSR_OFF);
+			ImGui::SetNextItemWidth(420.0f);
+			const bool smooth_changed = ImGui::SliderInt("Smoothness", &smoothness, 0, 100, "%d %%", ImGuiSliderFlags_AlwaysClamp);
+			smooth_active = ImGui::IsItemActive();
+			if (!pending && (ImGui::IsItemDeactivatedAfterEdit() || (smooth_changed && !smooth_active)))
+			{
+				s.dsr_method = method;
+				(method == WINE_DSR_NEURAL ? s.dldsr_smoothness : s.dsr_smoothness) = smoothness;
+				changed = true;
+			}
+			ImGui::SetItemTooltip("%s Changes apply when you release the slider.", method == WINE_DSR_NEURAL ?
+				"Higher values reduce native sharpening." : "Higher values broaden the Gaussian filter.");
+			ImGui::EndDisabled();
 		}
-		if (ds.reason[0] != '\0')
-			ImGui::TextColored(colour_issue, "Last issue: %s", ds.reason);
+
+		if (pending)
+		{
+			ImGui::BeginDisabled(!valid || (method == WINE_DSR_NEURAL && !neural));
+			if (ImGui::Button("Apply display settings"))
+			{
+				remember();
+				s.dsr_method = method;
+				s.desktop_w = width;
+				s.desktop_h = height;
+				s.dsr_w = last[WINE_DSR_GAUSSIAN].w;
+				s.dsr_h = last[WINE_DSR_GAUSSIAN].h;
+				s.dsr_smoothness = last[WINE_DSR_GAUSSIAN].smoothness;
+				s.dldsr_w = last[WINE_DSR_NEURAL].w;
+				s.dldsr_h = last[WINE_DSR_NEURAL].h;
+				s.dldsr_smoothness = last[WINE_DSR_NEURAL].smoothness;
+				changed = true;
+				pending = false;
+			}
+			ImGui::EndDisabled();
+			ImGui::SameLine();
+			if (ImGui::Button("Cancel display changes")) pending = false;
+		}
+
+		if (live && ds.dsr_error == ERROR_NOT_READY)
+			ImGui::TextDisabled("Waiting for the game's Vulkan surface");
+		else if (live && ds.dsr_error)
+			ImGui::TextColored(colour_issue, "Display control failed with error %lu", ds.dsr_error);
+		else if (live && ds.dsr.applied_generation != ds.dsr.generation)
+			ImGui::TextDisabled("Applying display settings");
+		else if (ds.switched && !ds.borderless)
+			ImGui::TextColored(colour_issue, "The game needs Borderless Windowed mode.");
+		else if (wanted_w && (ds.current.w != wanted_w || ds.current.h != wanted_h ||
+			 ds.buffer_w != wanted_w || ds.buffer_h != wanted_h))
+			ImGui::TextDisabled("Updating game output");
+		else if (!live)
+		{
+			if (ds.attached && !larger)
+				ImGui::TextDisabled("%ls lists no mode above %u x %u", ds.device, ds.native.w, ds.native.h);
+		}
+		else if (ds.dsr.reason != WINE_DSR_READY && ds.dsr.reason != WINE_DSR_NATIVE && ds.dsr.reason != WINE_DSR_DISABLED)
+			ImGui::TextColored(colour_issue, "%s: %s", ds.dsr.active_method == WINE_DSR_GAUSSIAN ? "DSR fallback" : "Downsampling unavailable",
+				forge::desktop::dsr_reason(ds.dsr.reason));
+		else if (ds.dsr.active_method == WINE_DSR_NEURAL || ds.dsr.active_method == WINE_DSR_GAUSSIAN)
+			ImGui::TextColored(colour_ok, "%s active", ds.dsr.active_method == WINE_DSR_NEURAL ? "DL-DSR" : "DSR");
+		else if (current_method != WINE_DSR_OFF)
+			ImGui::TextColored(colour_issue, "Downsampling is inactive on this presentation path");
+		if (ds.reason[0]) ImGui::TextColored(colour_issue, "%s", ds.reason);
 	}
 
 	// FileVersion of the loaded DLSS SR snippet, read once it is loaded
@@ -856,8 +965,12 @@ namespace
 		if (f.valid)
 		{
 			const int perf = f.eff_perf >= 0 && f.eff_perf < 6 ? f.eff_perf : 0;
-			snprintf(line1, sizeof(line1), "DLSS %s  preset %c  %u x %u -> %u x %u  %s", dlss_version(), ngx::preset_letter(f.eff_presets[perf]),
-				st.render_w, st.render_h, f.eff_out_w, f.eff_out_h, ngx::perf_quality_label(f.eff_perf));
+			if (st.render_w == f.eff_out_w && st.render_h == f.eff_out_h)
+				snprintf(line1, sizeof(line1), "DLSS %s  preset %c  %u x %u  %s", dlss_version(), ngx::preset_letter(f.eff_presets[perf]),
+					f.eff_out_w, f.eff_out_h, ngx::perf_quality_label(f.eff_perf));
+			else
+				snprintf(line1, sizeof(line1), "DLSS %s  preset %c  %u x %u -> %u x %u  %s", dlss_version(), ngx::preset_letter(f.eff_presets[perf]),
+					st.render_w, st.render_h, f.eff_out_w, f.eff_out_h, ngx::perf_quality_label(f.eff_perf));
 		}
 		else
 		{
@@ -877,7 +990,6 @@ namespace
 		ImDrawList *dl = ImGui::GetForegroundDrawList(nullptr);
 		if (dl == nullptr)
 			return;
-		const aligned_overlay_text aligned_text(dl);
 		const float line_h = ImGui::GetFontSize() + 2.0f;
 		const ImVec2 display = ImGui::GetIO().DisplaySize;
 		float y = display.y - 10.0f - line_h * (line2[0] ? 2.0f : 1.0f);
@@ -894,7 +1006,6 @@ namespace
 
 	void draw_overlay(reshade::api::effect_runtime *)
 	{
-		const aligned_overlay_text aligned_text(ImGui::GetWindowDrawList());
 		forge::settings s = forge::get_settings();
 		const forge::ngx_hook::stats st = forge::ngx_hook::get_stats();
 		bool changed = false;
@@ -915,7 +1026,7 @@ namespace
 
 		ImGui::BeginDisabled(!s.enabled);
 		changed |= ImGui::Checkbox("Guest mode", &s.guest_mode);
-		ImGui::SetItemTooltip("Delegate neural rendering to another NGX-aware add-on while keeping Forge DLSS/DLAA, resolution, preset, exposure and texture controls.");
+		ImGui::SetItemTooltip("Delegate neural rendering to another NGX-aware add-on. Forge keeps the DLSS/DLAA, resolution, preset and exposure controls.");
 
 		ImGui::SeparatorText("Render resolution");
 		int lock = static_cast<int>(s.lock);
@@ -943,7 +1054,8 @@ namespace
 		ImGui::SetItemTooltip("Render size as a percentage of the output size.");
 		changed |= ImGui::RadioButton("Game decides (in-game scale + dynamic resolution)", &lock, 0);
 		s.lock = static_cast<forge::render_lock>(lock);
-		ImGui::TextDisabled("Size queries: %llu, render %u x %u", static_cast<unsigned long long>(st.optimal_calls), st.render_w, st.render_h);
+		if (st.feature.valid && (st.render_w != st.feature.eff_out_w || st.render_h != st.feature.eff_out_h))
+			ImGui::TextDisabled("Scene resolution  %u x %u", st.render_w, st.render_h);
 
 		ImGui::SeparatorText("DLSS model");
 		int preset_index = 0;
@@ -964,7 +1076,6 @@ namespace
 			changed = true;
 		}
 
-		ImGui::SeparatorText("Diagnostics");
 		changed |= ImGui::Checkbox("DLSS on-screen indicator", &s.indicator);
 		ImGui::SetItemTooltip("Shows DLSS and DLSS 5 data at the bottom left, after the effects. The NVIDIA indicator stays off.");
 
@@ -976,8 +1087,6 @@ namespace
 		draw_nr(s.nr, changed);
 		ImGui::EndDisabled();
 		ImGui::Spacing();
-		ImGui::SeparatorText("DLSS telemetry");
-
 		if (changed)
 		{
 			const forge::settings before = forge::get_settings();
@@ -987,64 +1096,77 @@ namespace
 				forge::desktop::resetup();
 		}
 
-		// Live view
-		const auto &f = st.feature;
-		char buf[160];
-		if (f.valid)
+		if (ImGui::TreeNode("Diagnostics"))
 		{
-			ImGui::Text("Render now     %u x %u  (%.1f %% of output)", st.render_w, st.render_h, f.game_out_w ? 100.0 * st.render_w / f.game_out_w : 0.0);
-			float lo = 1000.0f, hi = 0.0f;
-			for (int i = 0; i < st.history_count; ++i)
+			const auto ds = forge::desktop::get();
+			if (ds.attached)
 			{
-				const float v = st.history[(st.history_pos - 1 - i + forge::ngx_hook::history_size) % forge::ngx_hook::history_size];
-				lo = v < lo ? v : lo;
-				hi = v > hi ? v : hi;
+				ImGui::Text("Desktop %u x %u, window %u x %u, buffer %u x %u", ds.current.w, ds.current.h,
+					ds.client_w, ds.client_h, ds.buffer_w, ds.buffer_h);
+				if (ds.dsr_control)
+					ImGui::Text("Wine: method %u, active %u, smoothness %u%%, image %u x %u -> %u x %u, generation %u/%u, result %d",
+						ds.dsr.method, ds.dsr.active_method, ds.dsr.active_smoothness, ds.dsr.source_width, ds.dsr.source_height,
+						ds.dsr.target_width, ds.dsr.target_height, ds.dsr.applied_generation, ds.dsr.generation, ds.dsr.result);
 			}
-			snprintf(buf, sizeof(buf), "render scale, last %d evaluations: %.1f .. %.1f %%  (%llu size changes)", st.history_count, lo, hi, static_cast<unsigned long long>(st.render_size_changes));
-			ImGui::PlotLines("##hist", st.history, forge::ngx_hook::history_size, st.history_pos, buf, 0.0f, 105.0f, ImVec2(0.0f, 60.0f), sizeof(float));
+			const auto &f = st.feature;
+			char buf[160];
+			if (f.valid)
+			{
+				ImGui::Text("Render now     %u x %u  (%.1f %% of output)", st.render_w, st.render_h, f.game_out_w ? 100.0 * st.render_w / f.game_out_w : 0.0);
+				float lo = 1000.0f, hi = 0.0f;
+				for (int i = 0; i < st.history_count; ++i)
+				{
+					const float v = st.history[(st.history_pos - 1 - i + forge::ngx_hook::history_size) % forge::ngx_hook::history_size];
+					lo = v < lo ? v : lo;
+					hi = v > hi ? v : hi;
+				}
+				snprintf(buf, sizeof(buf), "render scale, last %d evaluations: %.1f .. %.1f %%  (%llu size changes)", st.history_count, lo, hi, static_cast<unsigned long long>(st.render_size_changes));
+				ImGui::PlotLines("##hist", st.history, forge::ngx_hook::history_size, st.history_pos, buf, 0.0f, 105.0f, ImVec2(0.0f, 60.0f), sizeof(float));
 
-			ImGui::Text("Pipeline       %u x %u  ->  DLSS %u x %u", f.game_in_w, f.game_in_h, f.eff_out_w, f.eff_out_h);
-			preset_text(buf, sizeof(buf), f.eff_presets);
-			const double ratio = st.render_w != 0 ? static_cast<double>(f.eff_out_w) / st.render_w : 0.0;
-			ImGui::Text("Running        %s (%.2f:1), %s", ngx::perf_quality_label(f.eff_perf), ratio, buf);
-			flags_text(buf, sizeof(buf), f.eff_flags);
-			ImGui::Text("Flags          %s", buf);
-			preset_text(buf, sizeof(buf), f.game_presets);
-			ImGui::TextDisabled("Game asked for %u x %u -> %u x %u, %s, %s", f.game_in_w, f.game_in_h, f.game_out_w, f.game_out_h, ngx::perf_quality_label(f.game_perf), buf);
-			flags_text(buf, sizeof(buf), f.game_flags);
-			ImGui::TextDisabled("Game flags     %s%s", buf, f.game_output_subrects ? ", output subrects" : "");
-			ImGui::TextDisabled("Feature        %s, re-creates %llu", f.using_own_feature ? "forge-created" : "game-created",
-				static_cast<unsigned long long>(f.recreates));
-		}
-		if (st.optimal_calls != 0)
-			ImGui::TextDisabled("Size query     %u x %u %s: NGX %u x %u (dynamic %u..%u x %u..%u) -> %s %u x %u",
-				st.opt_target_w, st.opt_target_h, ngx::perf_quality_label(st.opt_perf), st.opt_ngx_w, st.opt_ngx_h,
-				st.opt_ngx_min_w, st.opt_ngx_max_w, st.opt_ngx_min_h, st.opt_ngx_max_h,
-				st.opt_overridden ? "locked to" : "game uses", st.opt_ret_w, st.opt_ret_h);
-		ImGui::TextDisabled("Evaluations    %llu (resets %llu), jitter %.3f %.3f, last 0x%08X",
-			static_cast<unsigned long long>(st.evaluations), static_cast<unsigned long long>(st.resets),
-			st.jitter_x, st.jitter_y, st.last_result);
-		ImGui::TextDisabled("NGX core       %s (%u entry points routed%s)", st.core_path[0] ? st.core_path : "not loaded yet", st.resolved, st.callback_wrapped ? ", size query wrapped" : "");
-		if (st.last_error[0] != '\0')
-			ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.35f, 1.0f), "Last issue: %s", st.last_error);
+				ImGui::Text("Pipeline       %u x %u  ->  DLSS %u x %u", f.game_in_w, f.game_in_h, f.eff_out_w, f.eff_out_h);
+				preset_text(buf, sizeof(buf), f.eff_presets);
+				const double ratio = st.render_w != 0 ? static_cast<double>(f.eff_out_w) / st.render_w : 0.0;
+				ImGui::Text("Running        %s (%.2f:1), %s", ngx::perf_quality_label(f.eff_perf), ratio, buf);
+				flags_text(buf, sizeof(buf), f.eff_flags);
+				ImGui::Text("Flags          %s", buf);
+				preset_text(buf, sizeof(buf), f.game_presets);
+				ImGui::TextDisabled("Game asked for %u x %u -> %u x %u, %s, %s", f.game_in_w, f.game_in_h, f.game_out_w, f.game_out_h, ngx::perf_quality_label(f.game_perf), buf);
+				flags_text(buf, sizeof(buf), f.game_flags);
+				ImGui::TextDisabled("Game flags     %s%s", buf, f.game_output_subrects ? ", output subrects" : "");
+				ImGui::TextDisabled("Feature        %s, re-creates %llu", f.using_own_feature ? "forge-created" : "game-created",
+					static_cast<unsigned long long>(f.recreates));
+			}
+			if (st.optimal_calls != 0)
+				ImGui::TextDisabled("Size query     %u x %u %s: NGX %u x %u (dynamic %u..%u x %u..%u) -> %s %u x %u",
+					st.opt_target_w, st.opt_target_h, ngx::perf_quality_label(st.opt_perf), st.opt_ngx_w, st.opt_ngx_h,
+					st.opt_ngx_min_w, st.opt_ngx_max_w, st.opt_ngx_min_h, st.opt_ngx_max_h,
+					st.opt_overridden ? "locked to" : "game uses", st.opt_ret_w, st.opt_ret_h);
+			ImGui::TextDisabled("Evaluations    %llu (resets %llu), jitter %.3f %.3f, last 0x%08X",
+				static_cast<unsigned long long>(st.evaluations), static_cast<unsigned long long>(st.resets),
+				st.jitter_x, st.jitter_y, st.last_result);
+			ImGui::TextDisabled("NGX core       %s (%u entry points routed%s)", st.core_path[0] ? st.core_path : "not loaded yet", st.resolved, st.callback_wrapped ? ", size query wrapped" : "");
+			if (st.last_error[0] != '\0')
+				ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.35f, 1.0f), "Last issue: %s", st.last_error);
 
-		ImGui::Spacing();
-		if (ImGui::TreeNode("Debug"))
-		{
-			forge::settings d = forge::get_settings();
-			bool debug_changed = ImGui::Checkbox("Motion capture", &d.motion_capture);
-			ImGui::SetItemTooltip("Records FFXIV's NGX parameters, motion measurements, reprojection errors and image samples into forge-captures. Copies use extra GPU memory while enabled; nothing runs while it is off. This switch lasts for this session.");
-			ImGui::SetNextItemWidth(260.0f);
-			debug_changed |= ImGui::Combo("Capture test", &d.motion_capture_test,
-				"Static scene\0Camera pan\0Moving character\0Resolution change\0DLSS upscaling\0NR comparison\0ReShade comparison\0Other\0");
-			if (debug_changed)
-				forge::set_settings(d);
-			const auto capture = forge::motion_diagnostics::get_status();
-			if (capture.folder[0] != 0) ImGui::TextWrapped("Capture: %s", capture.folder);
-			if (capture.active || capture.frames || capture.surfaces)
-				ImGui::Text("Frames %llu, measured %llu, surfaces %llu, dropped %llu, copies %.0f MiB", static_cast<unsigned long long>(capture.frames),
-					static_cast<unsigned long long>(capture.measured), static_cast<unsigned long long>(capture.surfaces), static_cast<unsigned long long>(capture.dropped), capture.memory_mib);
-			if (capture.issue[0] != 0) ImGui::TextWrapped("Capture: %s", capture.issue);
+			ImGui::Spacing();
+			if (ImGui::TreeNode("Debug"))
+			{
+				forge::settings d = forge::get_settings();
+				bool debug_changed = ImGui::Checkbox("Motion capture", &d.motion_capture);
+				ImGui::SetItemTooltip("Records FFXIV's NGX parameters, motion measurements, reprojection errors and image samples into forge-captures. Copies use extra GPU memory while enabled. Nothing runs while it is off. This switch lasts for this session.");
+				ImGui::SetNextItemWidth(260.0f);
+				debug_changed |= ImGui::Combo("Capture test", &d.motion_capture_test,
+					"Static scene\0Camera pan\0Moving character\0Resolution change\0DLSS upscaling\0NR comparison\0ReShade comparison\0Other\0");
+				if (debug_changed)
+					forge::set_settings(d);
+				const auto capture = forge::motion_diagnostics::get_status();
+				if (capture.folder[0] != 0) ImGui::TextWrapped("Capture: %s", capture.folder);
+				if (capture.active || capture.frames || capture.surfaces)
+					ImGui::Text("Frames %llu, measured %llu, surfaces %llu, dropped %llu, copies %.0f MiB", static_cast<unsigned long long>(capture.frames),
+						static_cast<unsigned long long>(capture.measured), static_cast<unsigned long long>(capture.surfaces), static_cast<unsigned long long>(capture.dropped), capture.memory_mib);
+				if (capture.issue[0] != 0) ImGui::TextWrapped("Capture: %s", capture.issue);
+				ImGui::TreePop();
+			}
 			ImGui::TreePop();
 		}
 	}

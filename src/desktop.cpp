@@ -55,13 +55,15 @@ namespace
 	}
 
 	// The display's registry mode, the running mode, and every listed size from the registry mode up
-	void enumerate(const wchar_t *device, status &st)
+	void enumerate(const wchar_t *device, status &st, bool physical = false)
 	{
 		st.count = 0;
-		read_mode(device, ENUM_REGISTRY_SETTINGS, st.native);
+		read_mode(device, ENUM_REGISTRY_SETTINGS, st.original);
 		read_mode(device, ENUM_CURRENT_SETTINGS, st.current);
-		if (st.native.w == 0)
-			st.native = st.current;
+		if (st.original.w == 0)
+			st.original = st.current;
+		st.native = st.original;
+		st.physical = physical && read_mode(device, WINE_DSR_PHYSICAL_MODE, st.native);
 		mode m;
 		for (DWORD i = 0; read_mode(device, i, m); ++i)
 		{
@@ -86,6 +88,56 @@ namespace
 			}
 			st.modes[at] = m;
 		}
+	}
+
+	void update_dsr(HWND window, const forge::settings &s, ULONGLONG now)
+	{
+		static HWND last_window = nullptr;
+		static ULONGLONG last_poll = 0;
+		static unsigned int last_method = ~0u;
+		static int last_smoothness = -2;
+		static bool unsupported = false;
+		static int startup_smoothness = -1;
+		const int smoothness = s.dsr_method == WINE_DSR_NEURAL ? s.dldsr_smoothness : s.dsr_smoothness;
+		if (last_window != window)
+		{
+			last_window = window;
+			last_method = ~0u;
+			unsupported = false;
+		}
+		if (unsupported || (last_method == s.dsr_method && last_smoothness == smoothness && now - last_poll < 250))
+			return;
+		last_poll = now;
+		last_method = s.dsr_method;
+		last_smoothness = smoothness;
+
+		wine_dsr_control control = {};
+		control.hwnd = reinterpret_cast<uintptr_t>(window);
+		control.size = sizeof(control);
+		control.version = WINE_DSR_CONTROL_VERSION;
+		bool supported = SystemParametersInfoW(WINE_SPI_DSR_CONTROL, sizeof(control), &control, 0) != FALSE;
+		DWORD error = supported ? ERROR_SUCCESS : GetLastError();
+		supported = supported && control.size == sizeof(control) && control.version == WINE_DSR_CONTROL_VERSION &&
+			(control.capabilities & WINE_DSR_CAP_CONTROL) != 0;
+		if (supported && startup_smoothness < 0)
+			startup_smoothness = static_cast<int>(control.smoothness); // read before Forge sets its own value
+		// Each filter gets its own value; Wine holds one smoothness for both.
+		const unsigned int wanted = static_cast<unsigned int>(forge::filter_smoothness(s, s.dsr_method, startup_smoothness));
+		if (!supported)
+			unsupported = true;
+		else if (s.dsr_method != WINE_DSR_AUTO && (control.method != s.dsr_method || control.smoothness != wanted))
+		{
+			control.operation = WINE_DSR_SET;
+			control.method = s.dsr_method;
+			control.smoothness = wanted;
+			if (!SystemParametersInfoW(WINE_SPI_DSR_CONTROL, sizeof(control), &control, 0))
+				error = GetLastError();
+		}
+		guard g;
+		g_status.dsr_control = supported;
+		g_status.dsr = control;
+		g_status.dsr_error = error;
+		g_status.dsr_startup_smoothness = startup_smoothness;
 	}
 
 	const mode *listed(const status &st, unsigned int w, unsigned int h)
@@ -194,29 +246,31 @@ void forge::desktop::present(unsigned int buffer_w, unsigned int buffer_h)
 	if (!available())
 		return;
 
+	const settings s = get_settings();
+	update_dsr(h, s, now);
+
 	// The desktop is checked for 10 s after the selected mode, the game's buffer size or the first present
 	// changes, and left alone otherwise.
 	static ULONGLONG last_check = 0, watch_until = 0, last_switch = 0, last_nudge = 0;
 	static unsigned int switch_attempts = 0, nudges = 0, seen_w = 0, seen_h = 0, seen_buffer_w = 0, seen_buffer_h = 0;
 	static bool first = true;
+	static unsigned int seen_method = WINE_DSR_AUTO;
 	static mode last_wanted;
 	static status st;
 	if (now - last_check < 250)
 		return;
 	last_check = now;
-	const settings s = get_settings();
-	if (first || s.desktop_w != seen_w || s.desktop_h != seen_h || buffer_w != seen_buffer_w || buffer_h != seen_buffer_h)
+	if (first || s.desktop_w != seen_w || s.desktop_h != seen_h || s.dsr_method != seen_method ||
+		buffer_w != seen_buffer_w || buffer_h != seen_buffer_h)
 	{
 		first = false;
 		seen_w = s.desktop_w;
 		seen_h = s.desktop_h;
+		seen_method = s.dsr_method;
 		seen_buffer_w = buffer_w;
 		seen_buffer_h = buffer_h;
 		watch_until = now + 10000;
 	}
-	if (now > watch_until)
-		return;
-
 	MONITORINFOEXW mi = {};
 	mi.cbSize = sizeof(mi);
 	if (!GetMonitorInfoW(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), &mi))
@@ -224,10 +278,19 @@ void forge::desktop::present(unsigned int buffer_w, unsigned int buffer_h)
 		set_reason("GetMonitorInfo failed for the game window");
 		return;
 	}
-	if (wcscmp(st.device, mi.szDevice) != 0)
+	mode physical;
+	const bool live_control = get().dsr_control;
+	const bool physical_changed = live_control && read_mode(mi.szDevice, WINE_DSR_PHYSICAL_MODE, physical) &&
+		(!st.physical || physical.w != st.native.w || physical.h != st.native.h || physical.hz != st.native.hz);
+	if (wcscmp(st.device, mi.szDevice) != 0 || physical_changed)
 	{
+		if (st.device[0] && wcscmp(st.device, mi.szDevice) != 0 && get().switched)
+			switch_to(st.device, &st.original, true);
 		wcscpy(st.device, mi.szDevice);
-		enumerate(st.device, st);
+		enumerate(st.device, st, live_control);
+		watch_until = now + 10000;
+		switch_attempts = nudges = 0;
+		last_wanted = {};
 		char list[512];
 		size_t at = 0;
 		for (unsigned int i = 0; i < st.count && at + 24 < sizeof(list); ++i)
@@ -236,13 +299,15 @@ void forge::desktop::present(unsigned int buffer_w, unsigned int buffer_h)
 	}
 	else
 	{
+		if (now > watch_until) return;
 		read_mode(st.device, ENUM_CURRENT_SETTINGS, st.current);
 	}
 
-	// The selected mode: 0 x 0 is the registry mode
-	mode wanted = st.native;
-	bool registry = true;
-	if (s.desktop_w != 0 && s.desktop_h != 0 && (s.desktop_w != st.native.w || s.desktop_h != st.native.h))
+	// Off uses the physical mode. Automatic 0 x 0 preserves the registry default.
+	mode wanted = s.dsr_method == WINE_DSR_OFF ? st.native : st.original;
+	bool registry = wanted.w == st.original.w && wanted.h == st.original.h;
+	if (s.dsr_method != WINE_DSR_OFF && s.desktop_w != 0 && s.desktop_h != 0 &&
+		(s.desktop_w != st.original.w || s.desktop_h != st.original.h))
 	{
 		const mode *m = listed(st, s.desktop_w, s.desktop_h);
 		if (m == nullptr)
@@ -251,8 +316,13 @@ void forge::desktop::present(unsigned int buffer_w, unsigned int buffer_h)
 		}
 		else
 		{
-			wanted = *m;
-			registry = false;
+			if (s.dsr_method == WINE_DSR_NEURAL && !neural_mode(*m, st.native))
+				set_reason("The selected resolution has no DL-DSR model on this display");
+			else
+			{
+				wanted = *m;
+				registry = false;
+			}
 		}
 	}
 	if (wanted.w != last_wanted.w || wanted.h != last_wanted.h)
@@ -312,6 +382,8 @@ void forge::desktop::present(unsigned int buffer_w, unsigned int buffer_h)
 	g_status.attached = true;
 	wcscpy(g_status.device, st.device);
 	g_status.native = st.native;
+	g_status.original = st.original;
+	g_status.physical = st.physical;
 	g_status.current = st.current;
 	g_status.count = st.count;
 	std::memcpy(g_status.modes, st.modes, sizeof(g_status.modes));
@@ -350,4 +422,32 @@ forge::desktop::status forge::desktop::get()
 {
 	guard g;
 	return g_status;
+}
+
+bool forge::desktop::neural_mode(const mode &m, const mode &native)
+{
+	if (!native.w || !native.h) return false;
+	constexpr unsigned int scales[] = {13333u, 15000u};
+	for (unsigned int scale : scales)
+		if (m.w == (static_cast<uint64_t>(native.w) * scale + 5000) / 10000 &&
+			m.h == (static_cast<uint64_t>(native.h) * scale + 5000) / 10000)
+			return true;
+	return false;
+}
+
+const char *forge::desktop::dsr_reason(unsigned int reason)
+{
+	switch (reason)
+	{
+	case WINE_DSR_READY: return "Active";
+	case WINE_DSR_WAITING: return "Waiting for presentation";
+	case WINE_DSR_ASSETS: return "DL-DSR assets are unavailable";
+	case WINE_DSR_DEVICE: return "DL-DSR is unavailable on this Vulkan device";
+	case WINE_DSR_FORMAT: return "DSR does not support this image format or presentation path";
+	case WINE_DSR_FACTOR: return "This resolution has no DL-DSR model";
+	case WINE_DSR_SETUP: return "DL-DSR setup failed";
+	case WINE_DSR_NATIVE: return "Native display mode";
+	case WINE_DSR_DISABLED: return "Off";
+	default: return "DSR does not support this presentation path";
+	}
 }

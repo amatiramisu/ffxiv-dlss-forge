@@ -16,9 +16,15 @@ Choose DLAA, a fixed render scale, or the game's own resolution settings. Select
 
 Under Proton, dxvk-nvapi DRS preset overrides such as `DXVK_NVAPI_DRS_NGX_DLSS_SR_OVERRIDE_RENDER_PRESET_SELECTION` take priority over the preset chosen here.
 
-## Desktop resolution
+## Display supersampling
 
-Set FFXIV to Borderless Windowed and choose a desktop resolution above the monitor's. On Windows the list comes from NVIDIA DSR. On Linux it needs [proton-wineland-ffxiv](https://github.com/amatiramisu/proton-wineland-ffxiv), selected in XIVLauncher. Forge needs no extra environment variables or DLL overrides.
+With [proton-wineland-ffxiv](https://github.com/amatiramisu/proton-wineland-ffxiv), choose Off, DSR or DL-DSR and the game output resolution. Apply changes while the game runs in Borderless Windowed mode. Each filter keeps its own smoothness. Off restores the physical display mode and keeps the selected supersampling resolution.
+
+The controls use Wine display data on KDE, GNOME and other supported desktops. The panel shows the physical display size and game output once. DLSS shows a separate scene resolution when it differs from the output. Detailed buffer sizes and original game requests are under Diagnostics.
+
+DSR uses a linear-light Gaussian filter. Native NVIDIA DL-DSR supports the 1.78× and 2.25× modes. Proton Wineland FFXIV releases include the DL-DSR assets and select them automatically. Source builds need user-provided assets as described in the Proton repository. Both filters currently support SDR. DLSS scene settings and DLSS 5 model scale remain separate from display supersampling.
+
+On native Windows, NVIDIA driver settings control display supersampling.
 
 ## DLSS 5
 

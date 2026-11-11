@@ -22,6 +22,11 @@ void forge::set_settings(const settings &s)
 	settings n = s;
 	if (n.render_scale < 33.4f) n.render_scale = 33.4f;
 	if (n.render_scale > 100.0f) n.render_scale = 100.0f;
+	if (n.dsr_method > WINE_DSR_NEURAL) n.dsr_method = WINE_DSR_AUTO;
+	if (n.dsr_smoothness < -1) n.dsr_smoothness = -1;
+	if (n.dsr_smoothness > 100) n.dsr_smoothness = 100;
+	if (n.dldsr_smoothness < -1) n.dldsr_smoothness = -1;
+	if (n.dldsr_smoothness > 100) n.dldsr_smoothness = 100;
 
 	AcquireSRWLockExclusive(&s_lock);
 	const settings &o = s_settings;
