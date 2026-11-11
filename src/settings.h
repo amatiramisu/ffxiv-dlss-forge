@@ -28,7 +28,6 @@ namespace forge
 		unsigned int preset = 11;    // NGX preset value; 0 = game/NVIDIA default, 11 = K
 		exposure_mode exposure = exposure_mode::game;
 		unsigned int desktop_w = 0, desktop_h = 0; // desktop mode to run the game on; 0 x 0 = the display's registry mode
-		float lod_bias = 0.0f;       // added to mipmapped sampler LOD bias at sampler creation
 		bool indicator = false;      // NVIDIA DLSS on-screen indicator
 		bool motion_capture = false; // session-only NGX metadata and GPU measurements
 		int motion_capture_test = 0;

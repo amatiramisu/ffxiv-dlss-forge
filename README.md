@@ -1,6 +1,6 @@
 # FFXIV DLSS Forge
 
-A ReShade add-on for FFXIV's DLSS: DLAA, render resolution, presets, exposure, texture LOD bias, DSR desktop resolutions and DLSS 5 neural rendering.
+A ReShade add-on for FFXIV's DLSS: DLAA, render resolution, presets, exposure, DSR desktop resolutions and DLSS 5 neural rendering.
 
 ## Install
 
@@ -12,7 +12,7 @@ This is a Linux-first implementation (Wayland - enabled in XIVLauncher as well),
 
 ## DLSS
 
-Choose DLAA, a fixed render scale, or the game's own resolution settings. Select the DLSS preset and whether exposure follows the game or DLSS auto-exposure. Texture LOD bias can be set manually or matched to the render ratio; restart the game to apply it to all textures.
+Choose DLAA, a fixed render scale, or the game's own resolution settings. Select the DLSS preset and whether exposure follows the game or DLSS auto-exposure.
 
 Under Proton, dxvk-nvapi DRS preset overrides such as `DXVK_NVAPI_DRS_NGX_DLSS_SR_OVERRIDE_RENDER_PRESET_SELECTION` take priority over the preset chosen here.
 

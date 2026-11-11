@@ -13,7 +13,6 @@
 #include "overlay_text.h"
 #include "settings.h"
 
-#include <atomic>
 #include <cfloat>
 #include <cmath>
 #include <cstdio>
@@ -30,7 +29,6 @@ extern "C" __declspec(dllexport) const char *DESCRIPTION =
 namespace
 {
 	constexpr const char *section = "FFXIV_DLSS_FORGE";
-	std::atomic<uint64_t> g_biased_samplers { 0 };
 	bool g_registered = false;
 
 	float read_float(const char *key, float fallback)
@@ -220,7 +218,6 @@ namespace
 			s.exposure = forge::exposure_mode::game;
 		s.desktop_w = static_cast<unsigned int>(read_int("DesktopWidth", static_cast<int>(s.desktop_w)));
 		s.desktop_h = static_cast<unsigned int>(read_int("DesktopHeight", static_cast<int>(s.desktop_h)));
-		s.lod_bias = read_float("LodBias", s.lod_bias);
 		s.indicator = read_int("Indicator", s.indicator ? 1 : 0) != 0;
 		load_nr(s.nr);
 		forge::set_settings(s);
@@ -236,24 +233,8 @@ namespace
 		reshade::set_config_value(nullptr, section, "Exposure", static_cast<int>(s.exposure));
 		reshade::set_config_value(nullptr, section, "DesktopWidth", static_cast<int>(s.desktop_w));
 		reshade::set_config_value(nullptr, section, "DesktopHeight", static_cast<int>(s.desktop_h));
-		write_float("LodBias", s.lod_bias);
 		reshade::set_config_value(nullptr, section, "Indicator", s.indicator ? 1 : 0);
 		save_nr(s.nr);
-	}
-
-	bool on_create_sampler(reshade::api::device *, reshade::api::sampler_desc &desc)
-	{
-		const forge::settings s = forge::get_settings();
-		if (!s.enabled || s.lod_bias == 0.0f)
-			return false;
-		if ((static_cast<uint32_t>(desc.filter) & 0x80) != 0) // comparison (shadow) samplers stay untouched
-			return false;
-		float bias = desc.mip_lod_bias + s.lod_bias;
-		if (bias < -16.0f) bias = -16.0f;
-		if (bias > 15.99f) bias = 15.99f;
-		desc.mip_lod_bias = bias;
-		g_biased_samplers.fetch_add(1, std::memory_order_relaxed);
-		return true;
 	}
 
 	struct preset_item { unsigned int value; const char *label; };
@@ -983,21 +964,6 @@ namespace
 			changed = true;
 		}
 
-		ImGui::SeparatorText("Textures");
-		ImGui::SetNextItemWidth(220.0f);
-		changed |= snap_slider("Texture LOD bias", &s.lod_bias, -2.0f, 0.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
-		ImGui::SameLine();
-		ImGui::BeginDisabled(!st.feature.valid || st.render_w == 0);
-		if (ImGui::Button("Match DLSS ratio"))
-		{
-			s.lod_bias = std::log2(static_cast<float>(st.render_w) / static_cast<float>(st.feature.game_out_w));
-			changed = true;
-		}
-		ImGui::EndDisabled();
-		ImGui::SetItemTooltip("Sets the bias to log2(render width / output width).");
-		ImGui::TextDisabled("Applies to new samplers. Restart the game to apply it to all textures. Biased samplers: %llu",
-			static_cast<unsigned long long>(g_biased_samplers.load(std::memory_order_relaxed)));
-
 		ImGui::SeparatorText("Diagnostics");
 		changed |= ImGui::Checkbox("DLSS on-screen indicator", &s.indicator);
 		ImGui::SetItemTooltip("Shows DLSS and DLSS 5 data at the bottom left, after the effects. The NVIDIA indicator stays off.");
@@ -1161,9 +1127,9 @@ namespace
 		dock_into_reshade_tabs();
 		const forge::settings s = forge::get_settings();
 		forge::ngx_hook::set_indicator_registry(false); // NVIDIA's indicator stays off; ours is drawn after the effects
-		FORGE_LOG("settings: active=%d guest=%d lock=%d scale=%.1f preset=%c exposure=%d desktop=%ux%u lod=%.2f indicator=%d",
+		FORGE_LOG("settings: active=%d guest=%d lock=%d scale=%.1f preset=%c exposure=%d desktop=%ux%u indicator=%d",
 			s.enabled, s.guest_mode, static_cast<int>(s.lock), s.render_scale, ngx::preset_letter(s.preset), static_cast<int>(s.exposure),
-			s.desktop_w, s.desktop_h, s.lod_bias, s.indicator);
+			s.desktop_w, s.desktop_h, s.indicator);
 		const forge::nr::tuning t = s.nr.resolve(0);
 		FORGE_LOG("DLSS 5: on=%d stage=%d temporal=%d passes=%u network=%u model=%c intensity=%.2f structure=%.2f tone=%.2f automask=%d character=%.2f resolution=%.0f%% mask=%d blend=%d",
 			s.nr.enabled, static_cast<int>(s.nr.selected_stage()), s.nr.temporal, s.nr.pass_count(), t.preset, 'A' + static_cast<char>(t.style),
@@ -1227,7 +1193,7 @@ namespace
 		if (image) image->Release();
 	}
 
-	// Session control for automated test runs (tools/motion_suite.py): forge-control.txt beside the add-on holds
+	// Session control for automated test runs (tests/motion_suite.py): forge-control.txt beside the add-on holds
 	// key=value lines, applied in order without writing ReShade.ini. Forge deletes the file and answers in
 	// forge-control.ack with the sequence number. The first command keeps the settings and effect state for restore=1.
 	struct control_state
@@ -1417,7 +1383,6 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE module, HMODULE reshade_
 		once = true;
 		init(module);
 	}
-	reshade::register_event<reshade::addon_event::create_sampler>(&on_create_sampler);
 	reshade::register_event<reshade::addon_event::init_swapchain>(&on_init_swapchain);
 	reshade::register_event<reshade::addon_event::init_effect_runtime>(&on_init_effect_runtime);
 	reshade::register_event<reshade::addon_event::present>(&on_present);
@@ -1448,7 +1413,6 @@ extern "C" __declspec(dllexport) void AddonUninit(HMODULE module, HMODULE reshad
 	reshade::unregister_event<reshade::addon_event::reshade_present>(&on_reshade_present);
 	reshade::unregister_event<reshade::addon_event::init_effect_runtime>(&on_init_effect_runtime);
 	reshade::unregister_event<reshade::addon_event::init_swapchain>(&on_init_swapchain);
-	reshade::unregister_event<reshade::addon_event::create_sampler>(&on_create_sampler);
 	forge::desktop::release();
 	reshade::unregister_addon(module, reshade_module);
 	g_registered = false;

@@ -351,8 +351,8 @@ namespace
 	void configuration(const forge::settings &s)
 	{
 		char b[768];
-		snprintf(b, sizeof(b), "test=%d forge=%d guest=%d lock=%d render_scale=%.9g preset=%u exposure=%d desktop=%ux%u lod=%.9g NR=%d stage=%d device=%d passes=%u work_scale=%.9g temporal=%d apply=%d compare=%d split=%.9g swap=%d debug=%d mask=%d blend=%d mask_show=%d estimate=%d white=%.9g",
-			s.motion_capture_test,s.enabled,s.guest_mode,static_cast<int>(s.lock),s.render_scale,s.preset,static_cast<int>(s.exposure),s.desktop_w,s.desktop_h,s.lod_bias,
+		snprintf(b, sizeof(b), "test=%d forge=%d guest=%d lock=%d render_scale=%.9g preset=%u exposure=%d desktop=%ux%u NR=%d stage=%d device=%d passes=%u work_scale=%.9g temporal=%d apply=%d compare=%d split=%.9g swap=%d debug=%d mask=%d blend=%d mask_show=%d estimate=%d white=%.9g",
+			s.motion_capture_test,s.enabled,s.guest_mode,static_cast<int>(s.lock),s.render_scale,s.preset,static_cast<int>(s.exposure),s.desktop_w,s.desktop_h,
 			s.nr.enabled,static_cast<int>(s.nr.selected_stage()),s.nr.device,s.nr.pass_count(),s.nr.work_scale,s.nr.temporal,s.nr.apply,s.nr.compare,s.nr.split,s.nr.swap,s.nr.debug_view,s.nr.mask.enabled,s.nr.mask.blend,s.nr.mask.show,s.nr.show_automask,s.nr.paper_white);
 		std::string text(b);
 		for (unsigned int i = 0; i < s.nr.pass_count(); ++i)

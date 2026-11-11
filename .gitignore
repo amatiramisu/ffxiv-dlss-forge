@@ -1,8 +1,5 @@
 build/
-# Agent material: tests, notes and capture tooling
 test/
+tests/
 docs/
-tools/motion_suite.py
-tools/suite_report.py
-tools/nr_visibility.py
-tools/motion_capture.py
+notes/
