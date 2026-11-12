@@ -8,7 +8,7 @@ Download the zip from [Releases](https://github.com/amatiramisu/ffxiv-dlss-forge
 Select NVIDIA DLSS in the game's Graphics Settings. Use the ReShade Overlay for the Forge.
 
 DLSS 5 needs `nvngx_dlssnr.dll` next to `ffxiv_dx11.exe`.
-(DL)-DSR on Linux would require [proton-wineland-ffxiv](https://github.com/amatiramisu/proton-wineland-ffxiv) -You might want to use the wineland release zip, rather than building from source.
+(DL)-DSR on Linux would require [proton-wineland-ffxiv](https://github.com/amatiramisu/proton-wineland-ffxiv) - You might want to use the wineland release zip, rather than building from source.
 Although both ways are viable, you'd need to provide the weights...
 
 ## Misc
