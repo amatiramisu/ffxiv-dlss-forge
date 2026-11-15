@@ -75,7 +75,31 @@ namespace forge::ngx_hook
 	void clear_native_context(ID3D11DeviceContext *ctx);
 	// The native immediate context for ReShade's wrapper of it; other contexts are returned unchanged
 	ID3D11DeviceContext *native_context(ID3D11DeviceContext *ctx);
+	// Order of ReShade's effects and the DLSS evaluate. effects_on_queue marks effects an add-on rendered on the game's
+	// immediate context on its render thread; end_effects_frame closes the frame at present. effects_in_dlss_input is
+	// the GetTickCount64 time of the last frame whose effects preceded its DLSS evaluate (0 for none): an add-on such as
+	// REST rendered them into the DLSS input, ahead of Before/After DLSS 5.
+	void effects_on_queue();
+	void end_effects_frame();
+	uint64_t effects_in_dlss_input();
+
+	// The Present stage is selected and DLSS 5 is on (settings only, no lock)
+	bool present_stage_selected();
+	// Present-thread work inside ReShade's present, which holds the immediate context's multithread lock: releases the
+	// model while DLSS 5 is off, runs the Present stage on `image` when `run_model` is set (frame_serial: the DLSS
+	// evaluation of the shown frame, 0 unknown) and motion capture's probe when `diagnostics` is set.
+	void present_frame(ID3D11DeviceContext *ctx, ID3D11Resource *image, bool run_model, bool linear_hdr, uint64_t frame_serial,
+		bool diagnostics, unsigned int color_space);
+	// The Present stage on the game's render thread, right before the first UI draw of the frame with DLSS evaluation
+	// `frame_serial`
+	void run_before_ui(ID3D11DeviceContext *ctx, ID3D11Resource *image, bool linear_hdr, uint64_t frame_serial);
+	// Counts DLSS evaluations of tracked features: one per game frame
+	uint64_t evaluation_serial();
+	// The thread that evaluates DLSS: the game's render thread (0 before the first evaluate)
+	DWORD evaluate_thread();
+	// Present stage and motion capture's probe in one call, outside ReShade's present (test harness)
 	void present_nr(ID3D11DeviceContext *ctx, ID3D11Resource *back_buffer, bool linear_hdr = false, unsigned int color_space = 0);
+	// Motion capture's probe after ReShade's effect pass, on the present thread inside ReShade's present
 	void capture_after_effects(ID3D11DeviceContext *ctx, ID3D11Resource *image);
 	void stop_motion_capture();
 

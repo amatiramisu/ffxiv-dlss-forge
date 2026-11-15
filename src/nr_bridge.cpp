@@ -272,9 +272,9 @@ namespace
 	// Frame log (config::frame_log): stats_rows x stats_cols floats per frame, read from a ring of staging textures.
 	// Rows: 0 model chain, 1 frame against the game frame, 2 motion vectors.
 	constexpr unsigned int stats_ring = 8;
-	constexpr unsigned int stats_rows = 3;
+	constexpr unsigned int stats_rows = 4;
 	constexpr unsigned int stats_cols = 8;
-	constexpr unsigned int row_chain = 0, row_frame = 1, row_motion = 2;
+	constexpr unsigned int row_chain = 0, row_frame = 1, row_motion = 2, row_near = 3;
 
 	struct frame_record
 	{
@@ -284,6 +284,7 @@ namespace
 		unsigned int reset_bits = 0; // 1 game, 2 first/failed, 4 gap, 8 inputs, 16 feature, 32 controls
 		unsigned int mode = 0;       // 0 linear HDR, 1 display-referred
 		unsigned int passes = 0;
+		char stage = 'A';            // B before upscaling, A after upscaling, P present
 	};
 
 	struct state
@@ -382,7 +383,7 @@ namespace
 		forge::nr::frame metadata;
 		ID3D11Device *device = nullptr;
 		ID3D11Texture2D *depth = nullptr, *motion = nullptr;
-		uint64_t serial = 0;
+		uint64_t serial = 0;   // presents when captured
 		bool ready = false;
 
 		void release()
@@ -393,7 +394,17 @@ namespace
 			safe_release(device);
 			metadata = {};
 		}
-	} g_capture;
+	};
+	// Two frames of guides: the game's render thread can capture the next frame's guides before the present thread
+	// shows the current one. metadata.serial names the DLSS evaluation of each.
+	present_capture g_captures[2];
+	unsigned int g_capture_next = 0;
+
+	void release_captures()
+	{
+		for (present_capture &c : g_captures)
+			c.release();
+	}
 
 	// Parameters the snippet reads at every evaluate (measured: a value written only at evaluate matches a
 	// feature built with it). The preset picks the network and is fixed when the feature is built.
@@ -1334,7 +1345,8 @@ namespace
 		g.stats_done = g.stats_next;
 		g.frame_log = on;
 		QueryPerformanceCounter(&g.log_start);
-		FORGE_LOG("frame log %s", on ? "on: frame ms reset mode passes | motion px max | game out stops abs | chain stops abs" : "off");
+		FORGE_LOG("frame log %s", on ? "on: frame ms stage(B/A/P) reset mode passes | motion px max | frame: game out stops abs |"
+			" near band (character): game out stops share | chain stops abs" : "off");
 	}
 
 	// Writes the records that the GPU completed, oldest first, and returns at the first record in progress
@@ -1359,10 +1371,11 @@ namespace
 					ctx->Unmap(g.stats_read[slot], 0);
 					if (g.frame_log)
 					{
-						const float *ch = v[row_chain], *fr = v[row_frame], *mo = v[row_motion];
-						FORGE_LOG("F %llu %.1f %u %u %u | %.1f %.1f | %.4f %.4f %+.3f %.3f | %+.3f %.3f",
-							static_cast<unsigned long long>(r.frame), r.time_ms, r.reset_bits, r.mode, r.passes,
-							mo[0], mo[4], fr[0], fr[1], stops(fr[0], fr[1]), fr[3], stops(ch[0], ch[1]), ch[3]);
+						const float *ch = v[row_chain], *fr = v[row_frame], *mo = v[row_motion], *ne = v[row_near];
+						FORGE_LOG("F %llu %.1f %c %u %u %u | %.1f %.1f | %.4f %.4f %+.3f %.3f | %.4f %.4f %+.3f %.2f | %+.3f %.3f",
+							static_cast<unsigned long long>(r.frame), r.time_ms, r.stage, r.reset_bits, r.mode, r.passes,
+							mo[0], mo[4], fr[0], fr[1], stops(fr[0], fr[1]), fr[3], ne[0], ne[1], stops(ne[0], ne[1]), ne[5],
+							stops(ch[0], ch[1]), ch[3]);
 					}
 				}
 				r.pending = false;
@@ -1729,11 +1742,11 @@ namespace
 	}
 
 	// The per-evaluate parameters of one pass; the resources are ID3D12Resource pointers or NGX Vulkan resources
-	void write_pass_params(Parameter *p, void *color, void *mvec, void *output, unsigned int ww, unsigned int wh,
+	void write_pass_params(Parameter *p, void *color, void *depth, void *mvec, void *output, unsigned int ww, unsigned int wh,
 		const forge::nr::frame &f, bool reset, float mv_x, float mv_y)
 	{
 		set_ptr(p, "DLSSNR.Color", color);
-		set_ptr(p, "DLSSNR.Depth", nullptr);
+		set_ptr(p, "DLSSNR.Depth", depth);
 		set_ptr(p, "DLSSNR.MVec", mvec);
 		set_ptr(p, "DLSSNR.Output", output);
 		set_ui(p, "DLSSNR.Enabled", 1);
@@ -1742,7 +1755,7 @@ namespace
 		set_ui(p, "DLSSNR.DepthInverted", f.depth_inverted ? 1u : 0u);
 		set_ui(p, "DLSSNR.Reset", reset ? 1u : 0u);
 		struct rect { const char *n; unsigned int w, h; };
-		for (const rect &rr : { rect { "Color", ww, wh }, rect { "Output", ww, wh }, rect { "Depth", 0, 0 }, rect { "MVec", mvec != nullptr ? ww : 0, mvec != nullptr ? wh : 0 } })
+		for (const rect &rr : { rect { "Color", ww, wh }, rect { "Output", ww, wh }, rect { "Depth", depth != nullptr ? ww : 0, depth != nullptr ? wh : 0 }, rect { "MVec", mvec != nullptr ? ww : 0, mvec != nullptr ? wh : 0 } })
 		{
 			char k[64];
 			snprintf(k, sizeof(k), "DLSSNR.%sSubrectBaseX", rr.n);
@@ -1875,7 +1888,7 @@ bool forge::nr::run(const frame &in, const config &c)
 		f.motion_w == 0 || f.motion_h == 0 || f.render_w == 0 || f.render_h == 0)
 		f.motion = nullptr;
 	const std::array<float, 2> jitter = { motion_to_uv(f.jitter_x, f.render_w), motion_to_uv(f.jitter_y, f.render_h) };
-	if (!c.mask.enabled || !g.probe_mask.empty() || f.guide_w == 0 || f.guide_h == 0)
+	if (f.guide_w == 0 || f.guide_h == 0)
 		f.depth = nullptr;
 	const auto guide = [&](view_set &views, ID3D11Resource *&resource, unsigned int x, unsigned int y, unsigned int &w, unsigned int &h, const char *name) {
 		if (resource == nullptr) { w = h = 0; return true; }
@@ -1983,7 +1996,7 @@ bool forge::nr::run(const frame &in, const config &c)
 	if (!ensure_shared(g.proxy, ww, wh, DXGI_FORMAT_R16G16B16A16_FLOAT, "model input") ||
 		!ensure_shared(g.model[0], ww, wh, DXGI_FORMAT_R16G16B16A16_FLOAT, "model output") ||
 		(passes > 1 && !ensure_shared(g.model[1], ww, wh, DXGI_FORMAT_R16G16B16A16_FLOAT, "second model output")) ||
-		(f.depth != nullptr && !ensure_shared(g.depth, f.guide_w, f.guide_h, DXGI_FORMAT_R32_FLOAT, "depth")) ||
+		(f.depth != nullptr && !ensure_shared(g.depth, ww, wh, DXGI_FORMAT_R32_FLOAT, "depth")) ||
 		(f.motion != nullptr && !ensure_shared(g.motion, ww, wh, motion_format, "motion vector")) ||
 		(mask_on && !ensure_shared(g.mask, mw, mh, mf, "control mask")) ||
 		(show_groups && !ensure_groups(ww, wh)) ||
@@ -2022,7 +2035,7 @@ bool forge::nr::run(const frame &in, const config &c)
 	key.render = { f.render_w, f.render_h };
 	key.motion_jittered = f.motion_jittered;
 	key.motion_scale = { cb.encoding[1], cb.encoding[2] };
-	key.format = static_cast<unsigned int>(image_desc.Format);
+	key.format = static_cast<unsigned int>(typed_uav_format(image_desc.Format));
 	key.position = c.selected_stage();
 	key.hdr = f.hdr;
 	key.white = f.hdr ? cb.encoding[0] : 1.0f;
@@ -2036,7 +2049,8 @@ bool forge::nr::run(const frame &in, const config &c)
 		key.mask_values = { cb.mask_env[0], cb.mask_env[1], cb.mask_near[0], cb.mask_near[1], cb.mask_near[2], cb.mask_near[3],
 			cb.mask_far[0], cb.mask_far[1], cb.mask_far[2], cb.mask_far[3], cb.mask_depth[0], cb.mask_depth[1] };
 	}
-	const uint64_t present = g_present.load(std::memory_order_relaxed);
+	// Frame counter for the history gap: the frame's DLSS evaluation, presents for frames without one (test harness)
+	const uint64_t present = in.serial != 0 ? in.serial : g_present.load(std::memory_order_relaxed);
 	unsigned int reset_bits = history_reset(f.reset, previous_valid, present, g.history_present, key, g.history);
 	bool chain_reset = reset_bits != 0;
 	for (unsigned int axis = 0; axis < 2; ++axis)
@@ -2059,17 +2073,19 @@ bool forge::nr::run(const frame &in, const config &c)
 	dispatch(f.ctx, reduced ? g.pack_work_cs : g.pack_color_cs, { g.keep_srv }, { { 0, g.proxy.uav } }, ww, wh);
 	if (f.depth != nullptr || f.motion != nullptr)
 		dispatch(f.ctx, g.pack_guides_cs, { f.depth != nullptr ? g.depth_in->srv : nullptr, f.motion != nullptr ? g.motion_in->srv : nullptr },
-			{ { 0, f.depth != nullptr ? g.depth.uav : nullptr }, { 1, f.motion != nullptr ? g.motion.uav : nullptr } },
-			(std::max)(f.guide_w, ww), (std::max)(f.guide_h, wh));
+			{ { 0, f.depth != nullptr ? g.depth.uav : nullptr }, { 1, f.motion != nullptr ? g.motion.uav : nullptr } }, ww, wh);
 	// Frame log probe: image a at the origin with size (aw, ah), image b at (bx, by) with size (bw, bh)
 	const bool logging = g.frame_log && g.stats_cs != nullptr && ensure_stats();
+	// near_depth restricts the probe to the near band of the developer mask (the character in third person and gpose)
 	const auto probe = [&](unsigned int row, ID3D11ShaderResourceView *a, unsigned int aw, unsigned int ah,
-		ID3D11ShaderResourceView *b, unsigned int bx, unsigned int by, unsigned int bw, unsigned int bh, bool motion) {
+		ID3D11ShaderResourceView *b, unsigned int bx, unsigned int by, unsigned int bw, unsigned int bh, bool motion,
+		ID3D11ShaderResourceView *near_depth = nullptr, bool near_band = false) {
 		struct { uint32_t a[4], b[4], mode[4]; float scale[4]; } params = {
-			{ 0, 0, aw, ah }, { bx, by, bw, bh }, { row, cb.modes[0] != 0 ? 1u : 0u, motion ? 1u : 0u, 0 }, { static_cast<float>(f.w), static_cast<float>(f.h), 0.0f, 0.0f } };
+			{ 0, 0, aw, ah }, { bx, by, bw, bh }, { row, cb.modes[0] != 0 ? 1u : 0u, motion ? 1u : 0u, near_band ? 1u : 0u },
+			{ static_cast<float>(f.w), static_cast<float>(f.h), cb.mask_near[3], cb.mask_depth[1] } };
 		f.ctx->UpdateSubresource(g.stats_cb, 0, nullptr, &params, 0, 0);
 		f.ctx->CSSetConstantBuffers(1, 1, &g.stats_cb);
-		dispatch(f.ctx, g.stats_cs, { a, b }, { { 0, g.stats_uav } }, 1, 1);
+		dispatch(f.ctx, g.stats_cs, { a, b, near_depth }, { { 0, g.stats_uav } }, 1, 1);
 	};
 	if (logging)
 		probe(row_motion, f.motion != nullptr ? g.motion.srv : nullptr, ww, wh, nullptr, 0, 0, 1, 1, true);
@@ -2123,7 +2139,8 @@ bool forge::nr::run(const frame &in, const config &c)
 			const tuning active = evaluate_tuning(pf.built, want_tuning(i));
 			const bool pass_reset = chain_reset || pf.reset;
 			reset_bits |= pf.reset ? 16u : 0u;
-			write_pass_params(g.params, &input.res, f.motion != nullptr ? &g.motion.res : nullptr, &g.model[out].res, ww, wh, f, pass_reset, mv_x, mv_y);
+			write_pass_params(g.params, &input.res, f.depth != nullptr ? &g.depth.res : nullptr, f.motion != nullptr ? &g.motion.res : nullptr,
+				&g.model[out].res, ww, wh, f, pass_reset, mv_x, mv_y);
 			write_mask_params(g.params, mask_on ? &g.mask.res : nullptr, mw, mh, blend);
 			write_tuning(g.params, active);
 			reset_bits |= output_changed(pf.evaluated, active) ? 32u : 0u;
@@ -2190,7 +2207,8 @@ bool forge::nr::run(const frame &in, const config &c)
 			const tuning active = evaluate_tuning(pf.built, want_tuning(i));
 			const bool pass_reset = chain_reset || pf.reset;
 			reset_bits |= pf.reset ? 16u : 0u;
-			write_pass_params(g.params, input, f.motion != nullptr ? g.motion.t12 : nullptr, g.model[out].t12, ww, wh, f, pass_reset, mv_x, mv_y);
+			write_pass_params(g.params, input, f.depth != nullptr ? g.depth.t12 : nullptr, f.motion != nullptr ? g.motion.t12 : nullptr,
+				g.model[out].t12, ww, wh, f, pass_reset, mv_x, mv_y);
 			write_mask_params(g.params, mask_on ? static_cast<void *>(g.mask.t12) : nullptr, mw, mh, blend);
 			write_tuning(g.params, active);
 			reset_bits |= output_changed(pf.evaluated, active) ? 32u : 0u;
@@ -2253,6 +2271,7 @@ bool forge::nr::run(const frame &in, const config &c)
 	if (logging && ran > 0)
 	{
 		probe(row_frame, g.keep_srv, f.w, f.h, g.output_srv, 0, 0, f.w, f.h, false);
+		probe(row_near, g.keep_srv, f.w, f.h, g.output_srv, 0, 0, f.w, f.h, false, f.depth != nullptr ? g.depth.srv : nullptr, true);
 		if (g.stats_next - g.stats_done >= stats_ring)
 		{
 			// The GPU is too far behind. The log skips the oldest record.
@@ -2269,6 +2288,7 @@ bool forge::nr::run(const frame &in, const config &c)
 		rec.frame = g.stats_next;
 		rec.time_ms = freq.QuadPart != 0 ? 1000.0 * static_cast<double>(tick.QuadPart - g.log_start.QuadPart) / static_cast<double>(freq.QuadPart) : 0.0;
 		rec.reset_bits = reset_bits;
+		rec.stage = c.selected_stage() == stage::before_upscaling ? 'B' : c.selected_stage() == stage::present ? 'P' : 'A';
 		rec.mode = cb.modes[0];
 		rec.passes = ran;
 		g.stats_next++;
@@ -2315,6 +2335,8 @@ bool forge::nr::run(const frame &in, const config &c)
 
 void forge::nr::capture_present(const frame &f)
 {
+	present_capture &g_capture = g_captures[g_capture_next];
+	g_capture_next ^= 1;
 	g_capture.ready = false;
 	if (f.ctx == nullptr) return;
 	ID3D11Device *device = nullptr;
@@ -2360,15 +2382,26 @@ void forge::nr::capture_present(const frame &f)
 	g_capture.ready = true;
 }
 
-bool forge::nr::run_present(ID3D11DeviceContext *ctx, ID3D11Resource *image, const config &c, bool linear_hdr)
+bool forge::nr::run_present(ID3D11DeviceContext *ctx, ID3D11Resource *image, const config &c, bool linear_hdr, uint64_t frame_serial)
 {
-	const bool fresh = g_capture.ready && g_capture.serial == g_present.load(std::memory_order_relaxed);
-	frame f = fresh ? g_capture.metadata : frame {};
-	g_capture.ready = false;
+	// The guides of the frame in `image`: by its DLSS evaluation when known, else the capture of this presentation interval
+	present_capture *pick = nullptr;
+	present_capture &latest = g_captures[g_capture_next ^ 1];
+	if (frame_serial != 0)
+	{
+		for (present_capture &slot : g_captures)
+			if (slot.ready && slot.metadata.serial == frame_serial)
+				pick = &slot;
+	}
+	else if (latest.ready && latest.serial == g_present.load(std::memory_order_relaxed))
+		pick = &latest;
+	frame f = pick != nullptr ? pick->metadata : frame {};
+	if (pick != nullptr)
+		pick->ready = false;
 	if (image == nullptr || ctx == nullptr) return false;
 	ID3D11Device *device = nullptr;
 	ctx->GetDevice(&device);
-	if (fresh && device != g_capture.device) f = frame {};
+	if (pick != nullptr && device != pick->device) f = frame {};
 	safe_release(device);
 	ID3D11Texture2D *texture = nullptr;
 	if (FAILED(image->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void **>(&texture)))) return false;
@@ -2384,10 +2417,12 @@ bool forge::nr::run_present(ID3D11DeviceContext *ctx, ID3D11Resource *image, con
 	return run(f, c);
 }
 
-void forge::nr::invalidate()
+void forge::nr::invalidate(uint64_t serial)
 {
 	g.history_valid = false;
-	g_capture.ready = false;
+	for (present_capture &slot : g_captures)
+		if (serial == 0 || slot.metadata.serial == serial)
+			slot.ready = false;
 }
 
 void forge::nr::end_frame()
@@ -2397,7 +2432,7 @@ void forge::nr::end_frame()
 
 void forge::nr::release()
 {
-	g_capture.release();
+	release_captures();
 	g.history_valid = false;
 	if (g.dev12 == nullptr && g.dev11 == nullptr && !g.v.on)
 		return;
@@ -2412,7 +2447,7 @@ void forge::nr::release()
 
 void forge::nr::detach()
 {
-	g_capture.release();
+	release_captures();
 	g.history_valid = false;
 	if (g.dev11 == nullptr)
 		return;

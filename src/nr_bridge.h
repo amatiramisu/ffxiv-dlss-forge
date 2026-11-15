@@ -31,6 +31,7 @@ namespace forge::nr
 		bool depth_inverted = false;
 		bool hdr = false;                     // the frame is linear HDR (DLSS IsHDR); otherwise display-referred
 		bool reset = false;
+		uint64_t serial = 0;                  // DLSS evaluation of this frame; Present-stage history follows it, 0 uses presents
 	};
 
 	struct pass_status
@@ -72,8 +73,11 @@ namespace forge::nr
 	bool run(const frame &f, const config &c);
 	// Copies this evaluation's guides before the game can reuse them.
 	void capture_present(const frame &f);
-	bool run_present(ID3D11DeviceContext *ctx, ID3D11Resource *image, const config &c, bool linear_hdr = false);
-	void invalidate();
+	// Present stage on `image`. frame_serial: the DLSS evaluation of the frame in `image`, which picks its guides
+	// (0: unknown, the capture of this presentation interval)
+	bool run_present(ID3D11DeviceContext *ctx, ID3D11Resource *image, const config &c, bool linear_hdr = false, uint64_t frame_serial = 0);
+	// History restarts; serial: the failed DLSS evaluation, whose guide capture goes (0: every capture)
+	void invalidate(uint64_t serial = 0);
 	void end_frame();
 	// Releases the model features and the per-size textures. The bridge device and NGX stay up for the
 	// session: NGX's D3D12 shutdown faults under Proton.

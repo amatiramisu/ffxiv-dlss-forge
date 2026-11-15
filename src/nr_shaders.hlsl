@@ -33,13 +33,14 @@ RWTexture2D<float> o_groups : register(u1);
 #elif defined(STATS)
 Texture2D<float4> g_a : register(t0);
 Texture2D<float4> g_b : register(t1);
+Texture2D<float> g_near_depth : register(t2); // packed depth at the model's working size, for the near band
 RWTexture2D<float> o_stats : register(u0);
 cbuffer stats_params : register(b1)
 {
 	uint4 g_stats_a;
 	uint4 g_stats_b;
-	uint4 g_stats_mode;   // row, sRGB luminance, motion, 0
-	float4 g_stats_scale;
+	uint4 g_stats_mode;   // row, sRGB luminance, motion, near band only
+	float4 g_stats_scale; // motion scale x, y; near band: log2 end distance, inverted depth
 };
 #elif defined(RESOLVE)
 Texture2D<float4> g_keep : register(t0);
@@ -87,14 +88,19 @@ void pack_color(uint3 id : SV_DispatchThreadID)
 #endif
 
 #if defined(PACK_GUIDES)
+// Depth and vectors at the model's working size, both from the guide texel under the same sample position
 [numthreads(8, 8, 1)]
 void pack_guides(uint3 id : SV_DispatchThreadID)
 {
-	if (g_motion_size.w != 0 && all(id.xy < g_sizes.xy))
-		o_depth[id.xy] = g_depth.Load(int3(g_guides.xy + id.xy, 0));
-	if (g_motion_size.z != 0 && all(id.xy < g_sizes.zw))
+	if (any(id.xy >= g_sizes.zw)) return;
+	float2 uv = (float2(id.xy) + 0.5) / float2(g_sizes.zw) + g_motion_map.xy;
+	if (g_motion_size.w != 0)
 	{
-		float2 uv = (float2(id.xy) + 0.5) / float2(g_sizes.zw) + g_motion_map.xy;
+		int2 at = clamp(int2(floor(uv * float2(g_sizes.xy))), int2(0, 0), int2(g_sizes.xy) - 1);
+		o_depth[id.xy] = g_depth.Load(int3(int2(g_guides.xy) + at, 0));
+	}
+	if (g_motion_size.z != 0)
+	{
 		int2 at = clamp(int2(floor(uv * float2(g_motion_size.xy))), int2(0, 0), int2(g_motion_size.xy) - 1);
 		float2 mv = g_motion.Load(int3(int2(g_guides.zw) + at, 0)) * g_encoding.yz + g_motion_map.zw;
 		o_motion[id.xy] = Finite(mv.x) && Finite(mv.y) ? mv : float2(0.0, 0.0);
@@ -130,9 +136,7 @@ void pack_mask(uint3 id : SV_DispatchThreadID)
 	float nearWeight = 0.0, farWeight = 0.0;
 	if (g_motion_size.w != 0)
 	{
-		float2 uv = (float2(id.xy) + 0.5) / float2(g_sizes.zw) + g_motion_map.xy;
-		int2 at = clamp(int2(floor(uv * float2(g_sizes.xy))), int2(0, 0), int2(g_sizes.xy) - 1);
-		float d = g_depth.Load(int3(at, 0));
+		float d = g_depth.Load(int3(id.xy, 0)); // packed at the working size by pack_guides
 		d = Finite(d) ? d : 0.0;
 		float dist = g_mask_depth.y != 0.0 ? 1.0 / max(d, 1e-6) : 1.0 / max(1.0 - d, 1e-6);
 		float ld = log2(max(dist, 1.0));
@@ -240,12 +244,31 @@ void stats(uint3 tid : SV_GroupThreadID)
 		}
 		else
 		{
-			int2 pb = int2(g_stats_b.xy) + min(int2(uv * float2(g_stats_b.zw)), int2(g_stats_b.zw) - 1);
-			float3 ca = Usable(a.rgb), cb = Usable(g_b.Load(int3(pb, 0)).rgb);
-			if (g_stats_mode.y != 0) { ca = SrgbToLinear(ca); cb = SrgbToLinear(cb); }
-			float ya = dot(ca, kLuma), yb = dot(cb, kLuma);
-			float d = log2((yb + 1e-4) / (ya + 1e-4));
-			acc += float4(ya, yb, d, abs(d));
+			bool use = true;
+			if (g_stats_mode.w != 0)
+			{
+				// Near band: pixels closer than the developer mask's near distance, the character in third person and gpose
+				uint dw, dh;
+				g_near_depth.GetDimensions(dw, dh);
+				use = dw != 0 && dh != 0;
+				if (use)
+				{
+					float z = g_near_depth.Load(int3(min(int2(uv * float2(dw, dh)), int2(dw, dh) - 1), 0));
+					z = Finite(z) ? z : 0.0;
+					float dist = g_stats_scale.w != 0.0 ? 1.0 / max(z, 1e-6) : 1.0 / max(1.0 - z, 1e-6);
+					use = log2(max(dist, 1.0)) < g_stats_scale.z;
+				}
+			}
+			if (use)
+			{
+				int2 pb = int2(g_stats_b.xy) + min(int2(uv * float2(g_stats_b.zw)), int2(g_stats_b.zw) - 1);
+				float3 ca = Usable(a.rgb), cb = Usable(g_b.Load(int3(pb, 0)).rgb);
+				if (g_stats_mode.y != 0) { ca = SrgbToLinear(ca); cb = SrgbToLinear(cb); }
+				float ya = dot(ca, kLuma), yb = dot(cb, kLuma);
+				float d = log2((yb + 1e-4) / (ya + 1e-4));
+				acc += float4(ya, yb, d, abs(d));
+				top += 1.0; // sample count in this mode
+			}
 		}
 	}
 	s_acc[t] = acc;
@@ -253,14 +276,16 @@ void stats(uint3 tid : SV_GroupThreadID)
 	GroupMemoryBarrierWithGroupSync();
 	if (t != 0) return;
 	float4 total = 0.0;
-	float peak = 0.0;
-	for (uint k = 0; k < 64; ++k) { total += s_acc[k]; peak = max(peak, s_top[k]); }
-	float4 mean = total / 2304.0;
+	float peak = 0.0, count = 0.0;
+	for (uint k = 0; k < 64; ++k) { total += s_acc[k]; peak = max(peak, s_top[k]); count += s_top[k]; }
+	const bool motion = g_stats_mode.z != 0;
+	float4 mean = total / (motion ? 2304.0 : max(count, 1.0));
 	uint row = g_stats_mode.x;
 	o_stats[uint2(0, row)] = mean.x;
 	o_stats[uint2(1, row)] = mean.y;
 	o_stats[uint2(2, row)] = mean.z;
 	o_stats[uint2(3, row)] = mean.w;
-	o_stats[uint2(4, row)] = peak;
+	o_stats[uint2(4, row)] = motion ? peak : 0.0;
+	o_stats[uint2(5, row)] = motion ? 1.0 : count / 2304.0; // share of the sampled pixels
 }
 #endif

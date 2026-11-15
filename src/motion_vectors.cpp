@@ -36,6 +36,13 @@ namespace
 		~guard() { ReleaseSRWLockExclusive(&g.lock); }
 	};
 
+	// For the present thread: holds the lock only when it is free
+	struct try_guard
+	{
+		const bool held = TryAcquireSRWLockExclusive(&g.lock) != 0;
+		~try_guard() { if (held) ReleaseSRWLockExclusive(&g.lock); }
+	};
+
 	DXGI_FORMAT typed(DXGI_FORMAT f)
 	{
 		switch (f)
@@ -128,9 +135,11 @@ void forge::motion::publish(ID3D11DeviceContext *ctx, ID3D11Resource *vectors, u
 	}
 }
 
-void forge::motion::end_frame()
+bool forge::motion::end_frame()
 {
-	guard l;
+	try_guard l;
+	if (!l.held)
+		return false;
 	if (!g.published && g.valid && g.info != nullptr && g.ctx != nullptr)
 	{
 		g.values[2] = 0.0f;
@@ -138,26 +147,31 @@ void forge::motion::end_frame()
 		g.valid = false;
 	}
 	g.published = false;
+	return true;
 }
 
-forge::motion::views forge::motion::get()
+bool forge::motion::get(views &out)
 {
-	guard l;
-	views v;
-	v.vectors = reinterpret_cast<uint64_t>(g.vectors);
-	v.info = reinterpret_cast<uint64_t>(g.info_view);
-	v.generation = g.generation;
-	return v;
+	try_guard l;
+	if (!l.held)
+		return false;
+	out.vectors = reinterpret_cast<uint64_t>(g.vectors);
+	out.info = reinterpret_cast<uint64_t>(g.info_view);
+	out.generation = g.generation;
+	return true;
 }
 
-void forge::motion::bound(uint64_t generation)
+bool forge::motion::bound(uint64_t generation)
 {
-	guard l;
+	try_guard l;
+	if (!l.held)
+		return false;
 	if (generation != g.generation)
-		return;
+		return true;
 	for (ID3D11ShaderResourceView *v : g.retired)
 		v->Release();
 	g.retired.clear();
+	return true;
 }
 
 void forge::motion::release()

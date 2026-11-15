@@ -20,17 +20,20 @@ namespace forge::motion
 	void publish(ID3D11DeviceContext *ctx, ID3D11Resource *vectors, unsigned int x, unsigned int y, unsigned int w, unsigned int h,
 		float scale_x, float scale_y);
 
+	// The next three run on the present thread inside ReShade's present, which holds the immediate context's lock while
+	// publish can hold this module's lock ahead of a context call; they return false and do nothing while publish runs.
+
 	// After ReShade's effects of a frame (reshade_present): clears the valid flag when no DLSS evaluate came since the last call
-	void end_frame();
+	bool end_frame();
 
 	// Views to bind (0 when none) and a counter that changes with them
 	struct views
 	{
 		uint64_t vectors = 0, info = 0, generation = 0;
 	};
-	views get();
+	bool get(views &out);
 	// ReShade binds the views of `generation` now: the views they replaced can go
-	void bound(uint64_t generation);
+	bool bound(uint64_t generation);
 
 	// The game's device is going away
 	void release();

@@ -12,6 +12,8 @@
 #include "nr_dll.h"
 #include "settings.h"
 
+#include <array>
+#include <atomic>
 #include <cfloat>
 #include <cmath>
 #include <cstdio>
@@ -564,6 +566,20 @@ namespace
 		return changed;
 	}
 
+	// True while the model produced a frame within the last second; the status keeps the values of its last frame
+	bool nr_live(const forge::nr::status &st)
+	{
+		static uint64_t seen = 0;
+		static ULONGLONG since = 0;
+		const ULONGLONG now = GetTickCount64();
+		if (st.frames != seen)
+		{
+			seen = st.frames;
+			since = now;
+		}
+		return now - since < 1000;
+	}
+
 	void draw_nr(forge::nr::config &c, bool &changed)
 	{
 		const forge::nr::status st = forge::nr::get_status();
@@ -579,6 +595,8 @@ namespace
 		}
 		else if (!c.enabled)
 			ImGui::TextDisabled("off");
+		else if (st.active && !nr_live(st))
+			ImGui::TextColored(colour_issue, "idle: no DLSS 5 frame in the last second");
 		else if (st.active)
 		{
 			char gpu[64] = "";
@@ -612,7 +630,12 @@ namespace
 			c.position = static_cast<forge::nr::stage>(position);
 			changed = true;
 		}
-		ImGui::SetItemTooltip("Before: processes the DLSS input. After: processes the DLSS output. Present: processes the final game image before ReShade effects and overlay.");
+		ImGui::SetItemTooltip("Before: processes the DLSS input. After: processes the DLSS output. Present: processes the finished game image right before the game draws its UI, after the effects REST renders there.");
+		const uint64_t input_effects = forge::ngx_hook::effects_in_dlss_input();
+		if (c.selected_stage() != forge::nr::stage::present && input_effects != 0 && GetTickCount64() - input_effects < 2000)
+			ImGui::TextColored(colour_issue, "ReShade effects reach the DLSS input in some frames, so this stage processes them then.\n"
+				"An add-on renders them before DLSS, such as a REST group on the game's last tonemap pass (\"UI 2\")\n"
+				"with all techniques. Switch that group to selected techniques, or use Present.");
 
 		int passes = static_cast<int>(c.pass_count());
 		ImGui::SetNextItemWidth(nr_width);
@@ -715,8 +738,13 @@ namespace
 			changed |= ImGui::Checkbox("Frame log", &c.frame_log);
 			ImGui::SetItemTooltip("Writes per-frame values to ffxiv-dlss-forge.log.");
 			if (st.ready)
-				ImGui::TextDisabled("%s, frame %u x %u, guides %u x %u%s, %s, %llu frames, %llu model builds, last 0x%08X", st.backend, st.frame_w, st.frame_h, st.guide_w, st.guide_h,
+			{
+				char guides[48] = "";
+				if (st.guide_w != 0 && (st.guide_w != st.frame_w || st.guide_h != st.frame_h))
+					snprintf(guides, sizeof(guides), ", guides %u x %u", st.guide_w, st.guide_h);
+				ImGui::TextDisabled("%s%s%s, %s, %llu frames, %llu model builds, last 0x%08X", st.backend, guides,
 					st.mask ? ", control mask" : "", st.hdr ? "HDR" : "display-referred", static_cast<unsigned long long>(st.frames), static_cast<unsigned long long>(st.creates), st.last_result);
+			}
 			ImGui::TreePop();
 		}
 		ImGui::EndDisabled();
@@ -1101,18 +1129,28 @@ namespace
 			const auto ds = forge::desktop::get();
 			if (ds.attached)
 			{
-				ImGui::Text("Desktop %u x %u, window %u x %u, buffer %u x %u", ds.current.w, ds.current.h,
-					ds.client_w, ds.client_h, ds.buffer_w, ds.buffer_h);
+				// Each size once: window, buffer and the Wine image appear only where they differ
+				char sizes[160] = "";
+				int n = snprintf(sizes, sizeof(sizes), "Desktop %u x %u", ds.current.w, ds.current.h);
+				if (ds.client_w != ds.current.w || ds.client_h != ds.current.h)
+					n += snprintf(sizes + n, sizeof(sizes) - n, ", window %u x %u", ds.client_w, ds.client_h);
+				if (ds.buffer_w != ds.client_w || ds.buffer_h != ds.client_h)
+					snprintf(sizes + n, sizeof(sizes) - n, ", buffer %u x %u", ds.buffer_w, ds.buffer_h);
+				ImGui::TextUnformatted(sizes);
 				if (ds.dsr_control)
-					ImGui::Text("Wine: method %u, active %u, smoothness %u%%, image %u x %u -> %u x %u, generation %u/%u, result %d",
-						ds.dsr.method, ds.dsr.active_method, ds.dsr.active_smoothness, ds.dsr.source_width, ds.dsr.source_height,
-						ds.dsr.target_width, ds.dsr.target_height, ds.dsr.applied_generation, ds.dsr.generation, ds.dsr.result);
+				{
+					char image[64] = "";
+					if (ds.dsr.source_width != ds.dsr.target_width || ds.dsr.source_height != ds.dsr.target_height)
+						snprintf(image, sizeof(image), ", image %u x %u -> %u x %u", ds.dsr.source_width, ds.dsr.source_height,
+							ds.dsr.target_width, ds.dsr.target_height);
+					ImGui::Text("Wine: method %u, active %u, smoothness %u%%%s, generation %u/%u, result %d",
+						ds.dsr.method, ds.dsr.active_method, ds.dsr.active_smoothness, image, ds.dsr.applied_generation, ds.dsr.generation, ds.dsr.result);
+				}
 			}
 			const auto &f = st.feature;
 			char buf[160];
 			if (f.valid)
 			{
-				ImGui::Text("Render now     %u x %u  (%.1f %% of output)", st.render_w, st.render_h, f.game_out_w ? 100.0 * st.render_w / f.game_out_w : 0.0);
 				float lo = 1000.0f, hi = 0.0f;
 				for (int i = 0; i < st.history_count; ++i)
 				{
@@ -1123,24 +1161,39 @@ namespace
 				snprintf(buf, sizeof(buf), "render scale, last %d evaluations: %.1f .. %.1f %%  (%llu size changes)", st.history_count, lo, hi, static_cast<unsigned long long>(st.render_size_changes));
 				ImGui::PlotLines("##hist", st.history, forge::ngx_hook::history_size, st.history_pos, buf, 0.0f, 105.0f, ImVec2(0.0f, 60.0f), sizeof(float));
 
-				ImGui::Text("Pipeline       %u x %u  ->  DLSS %u x %u", f.game_in_w, f.game_in_h, f.eff_out_w, f.eff_out_h);
+				// Rendered size now -> DLSS output; the feature's input size and the share only where they add something
+				char pipeline[160] = "";
+				int pn = snprintf(pipeline, sizeof(pipeline), "Pipeline       %u x %u  ->  DLSS %u x %u", st.render_w, st.render_h, f.eff_out_w, f.eff_out_h);
+				if (st.render_w != f.eff_out_w || st.render_h != f.eff_out_h)
+					pn += snprintf(pipeline + pn, sizeof(pipeline) - pn, "  (%.1f %%)", f.eff_out_w ? 100.0 * st.render_w / f.eff_out_w : 0.0);
+				if (f.game_in_w != st.render_w || f.game_in_h != st.render_h)
+					snprintf(pipeline + pn, sizeof(pipeline) - pn, ", feature input %u x %u", f.game_in_w, f.game_in_h);
+				ImGui::TextUnformatted(pipeline);
 				preset_text(buf, sizeof(buf), f.eff_presets);
 				const double ratio = st.render_w != 0 ? static_cast<double>(f.eff_out_w) / st.render_w : 0.0;
 				ImGui::Text("Running        %s (%.2f:1), %s", ngx::perf_quality_label(f.eff_perf), ratio, buf);
 				flags_text(buf, sizeof(buf), f.eff_flags);
 				ImGui::Text("Flags          %s", buf);
 				preset_text(buf, sizeof(buf), f.game_presets);
-				ImGui::TextDisabled("Game asked for %u x %u -> %u x %u, %s, %s", f.game_in_w, f.game_in_h, f.game_out_w, f.game_out_h, ngx::perf_quality_label(f.game_perf), buf);
+				char asked[64] = "";
+				if (f.game_in_w != st.render_w || f.game_in_h != st.render_h || f.game_out_w != f.eff_out_w || f.game_out_h != f.eff_out_h)
+					snprintf(asked, sizeof(asked), "%u x %u -> %u x %u, ", f.game_in_w, f.game_in_h, f.game_out_w, f.game_out_h);
+				ImGui::TextDisabled("Game asked for %s%s, %s", asked, ngx::perf_quality_label(f.game_perf), buf);
 				flags_text(buf, sizeof(buf), f.game_flags);
 				ImGui::TextDisabled("Game flags     %s%s", buf, f.game_output_subrects ? ", output subrects" : "");
 				ImGui::TextDisabled("Feature        %s, re-creates %llu", f.using_own_feature ? "forge-created" : "game-created",
 					static_cast<unsigned long long>(f.recreates));
 			}
 			if (st.optimal_calls != 0)
-				ImGui::TextDisabled("Size query     %u x %u %s: NGX %u x %u (dynamic %u..%u x %u..%u) -> %s %u x %u",
-					st.opt_target_w, st.opt_target_h, ngx::perf_quality_label(st.opt_perf), st.opt_ngx_w, st.opt_ngx_h,
-					st.opt_ngx_min_w, st.opt_ngx_max_w, st.opt_ngx_min_h, st.opt_ngx_max_h,
-					st.opt_overridden ? "locked to" : "game uses", st.opt_ret_w, st.opt_ret_h);
+			{
+				// The answer once; NGX's own size only where it differs from the answer
+				char ngx_size[48] = "";
+				if (st.opt_ngx_w != st.opt_ret_w || st.opt_ngx_h != st.opt_ret_h)
+					snprintf(ngx_size, sizeof(ngx_size), ", NGX %u x %u", st.opt_ngx_w, st.opt_ngx_h);
+				ImGui::TextDisabled("Size query     %s: %s %u x %u%s, dynamic %u..%u x %u..%u",
+					ngx::perf_quality_label(st.opt_perf), st.opt_overridden ? "locked to" : "game uses", st.opt_ret_w, st.opt_ret_h, ngx_size,
+					st.opt_ngx_min_w, st.opt_ngx_max_w, st.opt_ngx_min_h, st.opt_ngx_max_h);
+			}
 			ImGui::TextDisabled("Evaluations    %llu (resets %llu), jitter %.3f %.3f, last 0x%08X",
 				static_cast<unsigned long long>(st.evaluations), static_cast<unsigned long long>(st.resets),
 				st.jitter_x, st.jitter_y, st.last_result);
@@ -1271,47 +1324,411 @@ namespace
 	// back buffer comes from the native swapchain.
 	uint64_t g_bound_motion = UINT64_MAX; // generation of the motion vector views ReShade binds; a new runtime binds again
 
-	void on_init_effect_runtime(reshade::api::effect_runtime *)
+	// Present-stage DLSS 5 keeps one order with ReShade's effects in every frame. With game UI, the model runs right
+	// before the first UI draw: after the effects an add-on such as REST renders before the UI, ahead of ReShade's own
+	// pass at present. Without UI, it runs in the present callback, behind the other add-ons' (g_present_last) and ahead
+	// of ReShade's own pass. When the frames with UI had add-on effects ahead of the model, it waits for ReShade's own
+	// pass instead: REST renders nothing in a frame without UI, and that pass renders those effects.
+	reshade::api::effect_runtime *g_runtime = nullptr;
+	std::atomic<uint32_t> g_addon_techniques { 0 }; // add-on effects since the last present, outside ReShade's own pass
+	thread_local bool t_in_pass = false;            // this thread runs a render_effects pass
+	std::atomic<DWORD> g_present_thread { 0 };      // the thread of Forge's present callback
+	std::atomic<uint64_t> g_effects_eval { 0 };     // the DLSS evaluation during which an add-on last rendered effects on the render thread
+	std::atomic<int> g_ui_effects_first { -1 };     // the last frame with UI had add-on effects ahead of the model (-1: none yet)
+	// Present-thread state
+	bool g_after_present = false;                   // between Forge's present callback and the end of ReShade's present
+	bool g_effects_before_present = false;          // a render_effects pass finished before Forge's present callback
+	bool g_nr_deferred = false;                     // Present-stage DLSS 5 waits for ReShade's pass of this frame
+
+	// One log line per change of the DLSS 5 state and of the point where the Present stage ran
+	struct
 	{
-		g_bound_motion = UINT64_MAX;
+		int on = -1, stage = -1;
+		unsigned int passes = 0;
+	} g_nr_logged;
+	std::atomic<int> g_logged_path { -1 };
+
+	void log_nr_state(const forge::settings &s)
+	{
+		const int on = s.enabled && !s.guest_mode && s.nr.enabled ? 1 : 0;
+		const int stage = static_cast<int>(s.nr.selected_stage());
+		const unsigned int passes = s.nr.pass_count();
+		if (on == g_nr_logged.on && (on == 0 || (stage == g_nr_logged.stage && passes == g_nr_logged.passes)))
+			return;
+		g_nr_logged.on = on;
+		g_nr_logged.stage = stage;
+		g_nr_logged.passes = passes;
+		g_logged_path = -1;
+		static const char *const names[] = { "before upscaling (DLSS input)", "after upscaling (DLSS output)", "present" };
+		if (on)
+			FORGE_LOG("DLSS 5 on: stage %s, %u pass%s", names[stage < 0 || stage > 2 ? 1 : stage], passes, passes == 1 ? "" : "es");
+		else
+			FORGE_LOG("DLSS 5 off");
 	}
 
-	// ReShade keeps semantic bindings across effect reloads; they change only when the game's vector texture changes
+	// 0 present callback after add-on effects, 1 present callback without effects before it, 2 after ReShade's effect
+	// pass, 3 skipped: the pass Forge waited for did not come, 4 before the game's UI on its render thread
+	void log_present_path(int path, DWORD thread = 0)
+	{
+		if (g_logged_path.exchange(path) == path)
+			return;
+		static const char *const names[] = {
+			"in the present callback, after the effects an add-on rendered (REST or render_effects); no game UI this frame",
+			"in the present callback, with no add-on effects before it; no game UI this frame",
+			"after ReShade's own effect pass, before the overlay; no game UI this frame",
+			"skipped this frame: ReShade's effect pass did not come",
+			"right before the game's first UI draw, on its render thread" };
+		FORGE_LOG("Present stage runs %s (thread %lu)", names[path], thread != 0 ? thread : GetCurrentThreadId());
+	}
+	uint64_t g_deferred_frame = 0;                  // the frame the deferred present shows
+	bool g_present_last = false;                    // the present and draw callbacks are registered after the other add-ons'
+	void register_behind_addons();
+
+	void on_init_effect_runtime(reshade::api::effect_runtime *runtime)
+	{
+		g_bound_motion = UINT64_MAX;
+		g_runtime = runtime;
+		// Every add-on registered its callbacks when it loaded, and the game draws nothing before its swapchain exists
+		if (!g_present_last)
+			register_behind_addons();
+	}
+
+	void on_destroy_effect_runtime(reshade::api::effect_runtime *runtime)
+	{
+		if (g_runtime == runtime)
+			g_runtime = nullptr;
+	}
+
+	void on_begin_effects(reshade::api::effect_runtime *, reshade::api::command_list *, reshade::api::resource_view, reshade::api::resource_view)
+	{
+		t_in_pass = true;
+	}
+
+	// FFXIV's UI pixel shaders by the CRC32 of their bytecode, the numbers REST's FFXIV configuration and FFXIVRender use
+	// for the UI pass. The game draws the UI after its scene, post-processing and REST's pre-UI effects.
+	constexpr uint32_t ui_shader_crcs[] = { 3865947726u, 2966694105u, 3759127293u, 1898885941u, 4076256744u, 3915247300u, 1823062889u };
+	std::atomic<uint64_t> g_ui_shaders[32] = {}; // pipeline handles of those shaders, read without a lock on every draw
+
+	uint32_t crc32(const void *data, size_t size)
+	{
+		static const auto table = [] {
+			std::array<uint32_t, 256> t {};
+			for (uint32_t i = 0; i < 256; ++i)
+			{
+				uint32_t c = i;
+				for (int k = 0; k < 8; ++k)
+					c = c & 1 ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+				t[i] = c;
+			}
+			return t;
+		}();
+		uint32_t crc = 0xFFFFFFFFu;
+		for (const uint8_t *p = static_cast<const uint8_t *>(data), *end = p + size; p != end; ++p)
+			crc = (crc >> 8) ^ table[(crc ^ *p) & 0xFF];
+		return ~crc;
+	}
+
+	bool is_ui_shader(uint64_t handle)
+	{
+		if (handle == 0)
+			return false;
+		for (const std::atomic<uint64_t> &slot : g_ui_shaders)
+			if (slot.load(std::memory_order_relaxed) == handle)
+				return true;
+		return false;
+	}
+
+	// Present stage before the game's UI. On the frame's first UI draw on the immediate context, the game's render
+	// thread, the render target holds the finished scene with REST's pre-UI effects. The model processes it there, and
+	// the game then draws its UI over the result. Frames without a UI draw keep the Present stage in the present callback.
+	std::atomic<reshade::api::command_list *> g_immediate { nullptr }; // the game's immediate context (ReShade's command list)
+	std::atomic<bool> g_imm_ui { false };           // a UI pixel shader is bound on the immediate context
+	std::atomic<uint64_t> g_imm_rtv { 0 };          // render target 0 bound on the immediate context
+	std::atomic<bool> g_before_ui_armed { false };  // the Present stage is selected
+	std::atomic<bool> g_scrgb { false };            // the swapchain's colour space is scRGB
+	std::atomic<uint32_t> g_bb_w { 0 }, g_bb_h { 0 }; // swapchain size; the UI target matches it
+	std::atomic<uint64_t> g_before_ui_eval { 0 };   // DLSS evaluation of the last model run before the UI (0 none)
+	std::atomic<uint64_t> g_ui_evals[4] = {};       // the last evaluations whose frame ran the model before its UI
+	std::atomic<unsigned int> g_ui_eval_next { 0 };
+	// The frame in the swapchain image: the evaluation during which the render thread last wrote the back buffer.
+	// The present thread shows that frame, which tells it whether the model already ran before its UI.
+	std::atomic<uint64_t> g_bb_resource { 0 };      // swapchain buffer 0
+	std::atomic<uint64_t> g_bb_frame { 0 };
+
+	bool frame_had_ui(uint64_t eval)
+	{
+		for (const std::atomic<uint64_t> &e : g_ui_evals)
+			if (e.load(std::memory_order_relaxed) == eval)
+				return true;
+		return false;
+	}
+
+	// The game's immediate context on the thread that evaluates DLSS: its render thread
+	bool render_thread_immediate(reshade::api::command_list *cmd_list)
+	{
+		return cmd_list != nullptr && cmd_list == g_immediate.load(std::memory_order_relaxed) &&
+			GetCurrentThreadId() == forge::ngx_hook::evaluate_thread();
+	}
+
+	// A write into the swapchain image on the render thread marks the frame it will show
+	void note_back_buffer_write(uint64_t resource, const char *how)
+	{
+		if (resource == 0 || resource != g_bb_resource.load(std::memory_order_relaxed))
+			return;
+		static std::atomic<bool> logged { false };
+		if (!logged.exchange(true))
+			FORGE_LOG("the game writes the swapchain image by %s on its render thread (thread %lu, immediate context)", how, GetCurrentThreadId());
+		g_bb_frame.store(forge::ngx_hook::evaluation_serial(), std::memory_order_relaxed);
+	}
+	std::atomic<DWORD> g_render_thread { 0 };
+	std::atomic<uint32_t> g_deferred_ui_binds { 0 }; // UI shaders bound in deferred command lists (diagnostics)
+	std::atomic<uint32_t> g_other_ui_targets { 0 };  // first UI draws into a target of another size (diagnostics)
+
+	// Effects an add-on renders on the game's render thread: ahead of the DLSS evaluate they are in its input, after it
+	// they are in the image the model gets before the UI
+	void note_render_thread_effects(reshade::api::command_list *cmd_list)
+	{
+		if (!render_thread_immediate(cmd_list))
+			return;
+		forge::ngx_hook::effects_on_queue();
+		g_effects_eval.store(forge::ngx_hook::evaluation_serial(), std::memory_order_relaxed);
+	}
+
+	void on_render_technique(reshade::api::effect_runtime *, reshade::api::effect_technique, reshade::api::command_list *cmd_list,
+		reshade::api::resource_view, reshade::api::resource_view)
+	{
+		if (t_in_pass)
+			return; // a render_effects pass: ReShade's own at present, or counted at its finish
+		g_addon_techniques.fetch_add(1);
+		note_render_thread_effects(cmd_list);
+	}
+
+	void on_bind_pipeline(reshade::api::command_list *cmd_list, reshade::api::pipeline_stage stages, reshade::api::pipeline pipeline)
+	{
+		if ((static_cast<uint32_t>(stages) & static_cast<uint32_t>(reshade::api::pipeline_stage::pixel_shader)) == 0)
+			return;
+		const bool armed = g_before_ui_armed.load(std::memory_order_relaxed);
+		if (cmd_list == g_immediate.load(std::memory_order_relaxed))
+			g_imm_ui.store(armed && is_ui_shader(pipeline.handle), std::memory_order_relaxed);
+		else if (armed && is_ui_shader(pipeline.handle))
+			g_deferred_ui_binds.fetch_add(1, std::memory_order_relaxed);
+	}
+
+	void on_bind_render_targets(reshade::api::command_list *cmd_list, uint32_t count, const reshade::api::resource_view *rtvs, reshade::api::resource_view)
+	{
+		if (cmd_list != g_immediate.load(std::memory_order_relaxed))
+			return;
+		const uint64_t rtv = count != 0 && rtvs != nullptr ? rtvs[0].handle : 0;
+		g_imm_rtv.store(rtv, std::memory_order_relaxed);
+		if (rtv == 0 || !g_before_ui_armed.load(std::memory_order_relaxed) || GetCurrentThreadId() != forge::ngx_hook::evaluate_thread())
+			return;
+		ID3D11Resource *resource = nullptr;
+		reinterpret_cast<ID3D11RenderTargetView *>(rtv)->GetResource(&resource);
+		if (resource == nullptr)
+			return;
+		note_back_buffer_write(reinterpret_cast<uint64_t>(resource), "drawing");
+		resource->Release();
+	}
+
+	bool on_copy_resource(reshade::api::command_list *cmd_list, reshade::api::resource, reshade::api::resource dest)
+	{
+		if (g_before_ui_armed.load(std::memory_order_relaxed) && render_thread_immediate(cmd_list))
+			note_back_buffer_write(dest.handle, "a copy");
+		return false;
+	}
+
+	bool on_copy_texture_region(reshade::api::command_list *cmd_list, reshade::api::resource, uint32_t, const reshade::api::subresource_box *,
+		reshade::api::resource dest, uint32_t, const reshade::api::subresource_box *, reshade::api::filter_mode)
+	{
+		if (g_before_ui_armed.load(std::memory_order_relaxed) && render_thread_immediate(cmd_list))
+			note_back_buffer_write(dest.handle, "a region copy");
+		return false;
+	}
+
+	void before_ui(reshade::api::command_list *cmd_list)
+	{
+		if (!g_imm_ui.load(std::memory_order_relaxed) || cmd_list != g_immediate.load(std::memory_order_relaxed) ||
+			!g_before_ui_armed.load(std::memory_order_relaxed))
+			return;
+		// The first UI draw after this frame's DLSS evaluate; later UI draws of the frame pass through
+		const uint64_t eval = forge::ngx_hook::evaluation_serial();
+		if (eval == 0 || eval == g_before_ui_eval.load(std::memory_order_relaxed))
+			return;
+		const uint64_t rtv = g_imm_rtv.load(std::memory_order_relaxed);
+		if (rtv == 0)
+			return;
+		ID3D11Resource *image = nullptr;
+		reinterpret_cast<ID3D11RenderTargetView *>(rtv)->GetResource(&image);
+		if (image == nullptr)
+			return;
+		D3D11_TEXTURE2D_DESC d = {};
+		ID3D11Texture2D *texture = nullptr;
+		if (SUCCEEDED(image->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void **>(&texture))))
+		{
+			texture->GetDesc(&d);
+			texture->Release();
+		}
+		if (d.Width != 0 && d.Width == g_bb_w.load(std::memory_order_relaxed) && d.Height == g_bb_h.load(std::memory_order_relaxed) && d.SampleDesc.Count == 1)
+		{
+			g_before_ui_eval.store(eval, std::memory_order_relaxed);
+			g_ui_evals[g_ui_eval_next.fetch_add(1, std::memory_order_relaxed) % 4].store(eval, std::memory_order_relaxed);
+			g_render_thread.store(GetCurrentThreadId(), std::memory_order_relaxed);
+			// Add-on effects after this frame's DLSS evaluate are in the image ahead of the model
+			g_ui_effects_first.store(g_effects_eval.load(std::memory_order_relaxed) == eval ? 1 : 0, std::memory_order_relaxed);
+			static std::atomic<bool> logged { false };
+			if (!logged.exchange(true))
+				FORGE_LOG("Present stage: the game draws its UI into %s",
+					reinterpret_cast<uint64_t>(image) == g_bb_resource.load(std::memory_order_relaxed) ? "the swapchain image" : "a swapchain-sized image of its own");
+			forge::ngx_hook::run_before_ui(reinterpret_cast<ID3D11DeviceContext *>(cmd_list->get_native()), image,
+				g_scrgb.load(std::memory_order_relaxed), eval);
+		}
+		else
+			g_other_ui_targets.fetch_add(1, std::memory_order_relaxed);
+		image->Release();
+	}
+
+	// After REST's draw callbacks (registered behind them like the present callback), so REST's pre-UI effects come first
+	bool on_draw(reshade::api::command_list *cmd_list, uint32_t, uint32_t, uint32_t, uint32_t)
+	{
+		before_ui(cmd_list);
+		return false;
+	}
+
+	bool on_draw_indexed(reshade::api::command_list *cmd_list, uint32_t, uint32_t, uint32_t, int32_t, uint32_t)
+	{
+		before_ui(cmd_list);
+		return false;
+	}
+
+	bool on_draw_indirect(reshade::api::command_list *cmd_list, reshade::api::indirect_command type, reshade::api::resource, uint64_t, uint32_t, uint32_t)
+	{
+		if (type != reshade::api::indirect_command::dispatch)
+			before_ui(cmd_list);
+		return false;
+	}
+
+	// ReShade keeps semantic bindings across effect reloads; they change only when the game's vector texture changes.
+	// While the render thread publishes new views, binding waits for the next frame.
+	bool g_retire_motion = false; // the views ReShade bound before still wait for release
 	void bind_motion(reshade::api::effect_runtime *runtime)
 	{
-		const forge::motion::views v = forge::motion::get();
-		if (v.generation == g_bound_motion)
+		forge::motion::views v;
+		if (!forge::motion::get(v))
 			return;
-		runtime->update_texture_bindings(forge::motion::semantic_vectors, reshade::api::resource_view { v.vectors }, reshade::api::resource_view { v.vectors });
-		runtime->update_texture_bindings(forge::motion::semantic_info, reshade::api::resource_view { v.info }, reshade::api::resource_view { v.info });
-		g_bound_motion = v.generation;
-		forge::motion::bound(v.generation);
+		if (v.generation != g_bound_motion)
+		{
+			runtime->update_texture_bindings(forge::motion::semantic_vectors, reshade::api::resource_view { v.vectors }, reshade::api::resource_view { v.vectors });
+			runtime->update_texture_bindings(forge::motion::semantic_info, reshade::api::resource_view { v.info }, reshade::api::resource_view { v.info });
+			g_bound_motion = v.generation;
+			g_retire_motion = true;
+		}
+		if (g_retire_motion && forge::motion::bound(v.generation))
+			g_retire_motion = false;
+	}
+
+	// Once per kind: UI draws Forge cannot reach on the render thread, logged while the Present stage is selected
+	void log_ui_pass_issues(bool present_stage)
+	{
+		static bool deferred_logged = false, target_logged = false;
+		if (!present_stage)
+			return;
+		const uint32_t deferred = g_deferred_ui_binds.exchange(0, std::memory_order_relaxed);
+		const uint32_t other = g_other_ui_targets.exchange(0, std::memory_order_relaxed);
+		if (deferred != 0 && !deferred_logged)
+		{
+			deferred_logged = true;
+			FORGE_LOG("Present stage: the game bound UI shaders in a deferred command list (%u this frame)", deferred);
+		}
+		if (other != 0 && !target_logged)
+		{
+			target_logged = true;
+			FORGE_LOG("Present stage: UI draws into targets of another size than the swapchain are skipped; the model runs at the frame's first UI draw into the swapchain-sized target");
+		}
 	}
 
 	void on_present(reshade::api::command_queue *queue, reshade::api::swapchain *swapchain,
 		const reshade::api::rect *, const reshade::api::rect *, uint32_t, const reshade::api::rect *)
 	{
 		if (queue->get_device()->get_api() != reshade::api::device_api::d3d11) return;
+		auto *ctx = reinterpret_cast<ID3D11DeviceContext *>(queue->get_native());
+		g_present_thread.store(GetCurrentThreadId(), std::memory_order_relaxed);
+		const bool effects_done = g_addon_techniques.exchange(0) != 0 || g_effects_before_present;
+		forge::ngx_hook::end_effects_frame();
+		const bool present_stage = forge::ngx_hook::present_stage_selected();
+		log_nr_state(forge::get_settings());
+		// The frame in the swapchain image, by the evaluation during which the render thread wrote it. While the game
+		// draws its UI, the model already ran before it on the render thread. Without that record (another way of
+		// writing it), the last two evaluations stand in for it, which covers a render thread one frame ahead.
+		const uint64_t shown = g_bb_frame.exchange(0, std::memory_order_relaxed);
+		const uint64_t before_ui_eval = g_before_ui_eval.load(std::memory_order_relaxed);
+		const bool before_ui = present_stage && (shown != 0 ? frame_had_ui(shown)
+			: before_ui_eval != 0 && forge::ngx_hook::evaluation_serial() - before_ui_eval <= 2);
+		const bool here = present_stage && !before_ui;
+		// A frame without UI: ReShade's own pass follows unless an add-on rendered the effects already. The model waits
+		// for that pass when the frames with UI had add-on effects ahead of the model, so the order stays the same.
+		g_nr_deferred = here && !effects_done && g_ui_effects_first.load(std::memory_order_relaxed) == 1 &&
+			g_runtime != nullptr && g_runtime->get_effects_state();
+		g_deferred_frame = shown;
+		g_after_present = true;
+		if (before_ui)
+			log_present_path(4, g_render_thread.load(std::memory_order_relaxed));
+		else if (here && !g_nr_deferred)
+			log_present_path(effects_done ? 0 : 1);
+		const bool scrgb = swapchain->get_color_space() == reshade::api::color_space::scrgb;
+		g_scrgb.store(scrgb, std::memory_order_relaxed);
+		g_before_ui_armed.store(present_stage, std::memory_order_relaxed);
 		auto *native = reinterpret_cast<IDXGISwapChain *>(swapchain->get_native());
 		ID3D11Texture2D *image = nullptr;
 		if (native != nullptr && SUCCEEDED(native->GetBuffer(swapchain->get_current_back_buffer_index(),
-			__uuidof(ID3D11Texture2D), reinterpret_cast<void **>(&image))))
+			__uuidof(ID3D11Texture2D), reinterpret_cast<void **>(&image))) && image != nullptr)
 		{
-			forge::ngx_hook::present_nr(reinterpret_cast<ID3D11DeviceContext *>(queue->get_native()), image,
-				swapchain->get_color_space() == reshade::api::color_space::scrgb, static_cast<unsigned int>(swapchain->get_color_space()));
-			image->Release();
+			D3D11_TEXTURE2D_DESC bd = {};
+			image->GetDesc(&bd);
+			g_bb_w.store(bd.Width, std::memory_order_relaxed);
+			g_bb_h.store(bd.Height, std::memory_order_relaxed);
+			g_bb_resource.store(reinterpret_cast<uint64_t>(static_cast<ID3D11Resource *>(image)), std::memory_order_relaxed);
 		}
-		else forge::ngx_hook::present_nr(reinterpret_cast<ID3D11DeviceContext *>(queue->get_native()), nullptr);
-		forge::nr::end_frame();
+		forge::ngx_hook::present_frame(ctx, image, here && !g_nr_deferred, scrgb, shown, true,
+			image != nullptr ? static_cast<unsigned int>(swapchain->get_color_space()) : 0);
+		if (image != nullptr)
+			image->Release();
+		log_ui_pass_issues(present_stage);
+		if (!g_nr_deferred)
+			forge::nr::end_frame();
 	}
 
 	void on_finish_effects(reshade::api::effect_runtime *, reshade::api::command_list *list,
 		reshade::api::resource_view rtv, reshade::api::resource_view)
 	{
-		if (!forge::motion_diagnostics::active() || rtv.handle == 0 || list->get_device()->get_api() != reshade::api::device_api::d3d11) return;
+		t_in_pass = false;
+		// An add-on's render_effects pass on another thread counts like the techniques add-ons render
+		if (GetCurrentThreadId() != g_present_thread.load(std::memory_order_relaxed))
+		{
+			g_addon_techniques.fetch_add(1);
+			note_render_thread_effects(list);
+			return;
+		}
+		if (!g_after_present)
+		{
+			g_effects_before_present = true;
+			return;
+		}
+		if (list->get_device()->get_api() != reshade::api::device_api::d3d11) return;
+		auto *ctx = reinterpret_cast<ID3D11DeviceContext *>(list->get_native());
 		ID3D11Resource *image = nullptr;
-		reinterpret_cast<ID3D11RenderTargetView *>(rtv.handle)->GetResource(&image);
-		forge::ngx_hook::capture_after_effects(reinterpret_cast<ID3D11DeviceContext *>(list->get_native()), image);
+		if (rtv.handle != 0)
+			reinterpret_cast<ID3D11RenderTargetView *>(rtv.handle)->GetResource(&image);
+		if (g_nr_deferred)
+		{
+			// ReShade's own pass of this frame: the effects are in `rtv`, the overlay comes later
+			g_nr_deferred = false;
+			if (image != nullptr)
+				forge::ngx_hook::present_frame(ctx, image, true, g_scrgb.load(std::memory_order_relaxed), g_deferred_frame, false, 0);
+			log_present_path(2);
+			forge::nr::end_frame();
+		}
+		if (image != nullptr && forge::motion_diagnostics::active())
+			forge::ngx_hook::capture_after_effects(ctx, image);
 		if (image) image->Release();
 	}
 
@@ -1417,10 +1834,35 @@ namespace
 		}
 	}
 
+	// Registering again puts these callbacks after the other add-ons': the present callback follows their present-time
+	// effects, the draw callbacks follow REST's pre-UI effects
+	void register_behind_addons()
+	{
+		g_present_last = true;
+		reshade::unregister_event<reshade::addon_event::present>(&on_present);
+		reshade::register_event<reshade::addon_event::present>(&on_present);
+		reshade::unregister_event<reshade::addon_event::draw>(&on_draw);
+		reshade::register_event<reshade::addon_event::draw>(&on_draw);
+		reshade::unregister_event<reshade::addon_event::draw_indexed>(&on_draw_indexed);
+		reshade::register_event<reshade::addon_event::draw_indexed>(&on_draw_indexed);
+		reshade::unregister_event<reshade::addon_event::draw_or_dispatch_indirect>(&on_draw_indirect);
+		reshade::register_event<reshade::addon_event::draw_or_dispatch_indirect>(&on_draw_indirect);
+	}
+
 	void on_reshade_present(reshade::api::effect_runtime *runtime)
 	{
 		if (runtime->get_device()->get_api() != reshade::api::device_api::d3d11)
 			return;
+		if (g_nr_deferred)
+		{
+			// ReShade's pass did not come (effects loading or switched off): this frame goes without DLSS 5
+			g_nr_deferred = false;
+			log_present_path(3);
+			forge::nr::end_frame();
+		}
+		g_effects_before_present = g_after_present = false;
+		if (!g_present_last)
+			register_behind_addons(); // a runtime that started before Forge loaded
 		poll_control(runtime);
 		forge::motion::end_frame();
 		bind_motion(runtime);
@@ -1442,8 +1884,11 @@ namespace
 	// ReShade raises these for the immediate context only; get_native is the context below ReShade's wrapper
 	void on_init_command_queue(reshade::api::command_queue *queue)
 	{
-		if (queue->get_device()->get_api() == reshade::api::device_api::d3d11)
-			forge::ngx_hook::set_native_context(reinterpret_cast<ID3D11DeviceContext *>(queue->get_native()));
+		if (queue->get_device()->get_api() != reshade::api::device_api::d3d11)
+			return;
+		forge::ngx_hook::set_native_context(reinterpret_cast<ID3D11DeviceContext *>(queue->get_native()));
+		reshade::api::command_list *none = nullptr; // the first device's, like the native context
+		g_immediate.compare_exchange_strong(none, queue->get_immediate_command_list());
 	}
 
 	// D3D11 shares one state object per description, so another add-on's pipeline can hold one of the game's. REST
@@ -1464,6 +1909,24 @@ namespace
 			const reshade::api::pipeline_subobject_type t = subobjects[i].type;
 			state |= t == reshade::api::pipeline_subobject_type::blend_state || t == reshade::api::pipeline_subobject_type::rasterizer_state ||
 				t == reshade::api::pipeline_subobject_type::depth_stencil_state;
+			if (t == reshade::api::pipeline_subobject_type::pixel_shader && subobjects[i].count != 0 && subobjects[i].data != nullptr)
+			{
+				const auto *desc = static_cast<const reshade::api::shader_desc *>(subobjects[i].data);
+				if (desc->code == nullptr || desc->code_size == 0)
+					continue;
+				const uint32_t crc = crc32(desc->code, desc->code_size);
+				for (const uint32_t ui : ui_shader_crcs)
+					if (crc == ui)
+					{
+						for (std::atomic<uint64_t> &slot : g_ui_shaders)
+						{
+							uint64_t empty = 0;
+							if (slot.compare_exchange_strong(empty, pipeline.handle))
+								break;
+						}
+						FORGE_LOG("UI pixel shader %u found", crc);
+					}
+			}
 		}
 		if (!state)
 			return;
@@ -1474,11 +1937,22 @@ namespace
 			reinterpret_cast<IUnknown *>(pipeline.handle)->AddRef();
 	}
 
+	void on_destroy_pipeline(reshade::api::device *, reshade::api::pipeline pipeline)
+	{
+		for (std::atomic<uint64_t> &slot : g_ui_shaders)
+		{
+			uint64_t handle = pipeline.handle;
+			slot.compare_exchange_strong(handle, 0);
+		}
+	}
+
 	void on_destroy_command_queue(reshade::api::command_queue *queue)
 	{
 		if (queue->get_device()->get_api() != reshade::api::device_api::d3d11)
 			return;
 		forge::ngx_hook::clear_native_context(reinterpret_cast<ID3D11DeviceContext *>(queue->get_native()));
+		reshade::api::command_list *mine = queue->get_immediate_command_list();
+		g_immediate.compare_exchange_strong(mine, nullptr);
 		forge::motion::release();
 		AcquireSRWLockShared(&g_states_lock);
 		const size_t held = g_held_states.size();
@@ -1507,13 +1981,26 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE module, HMODULE reshade_
 	}
 	reshade::register_event<reshade::addon_event::init_swapchain>(&on_init_swapchain);
 	reshade::register_event<reshade::addon_event::init_effect_runtime>(&on_init_effect_runtime);
+	reshade::register_event<reshade::addon_event::destroy_effect_runtime>(&on_destroy_effect_runtime);
+	g_present_last = false;
+	g_nr_deferred = false;
 	reshade::register_event<reshade::addon_event::present>(&on_present);
+	reshade::register_event<reshade::addon_event::reshade_begin_effects>(&on_begin_effects);
+	reshade::register_event<reshade::addon_event::reshade_render_technique>(&on_render_technique);
 	reshade::register_event<reshade::addon_event::reshade_finish_effects>(&on_finish_effects);
 	reshade::register_event<reshade::addon_event::reshade_present>(&on_reshade_present);
 	reshade::register_event<reshade::addon_event::destroy_device>(&on_destroy_device);
 	reshade::register_event<reshade::addon_event::init_command_queue>(&on_init_command_queue);
 	reshade::register_event<reshade::addon_event::destroy_command_queue>(&on_destroy_command_queue);
 	reshade::register_event<reshade::addon_event::init_pipeline>(&on_init_pipeline);
+	reshade::register_event<reshade::addon_event::destroy_pipeline>(&on_destroy_pipeline);
+	reshade::register_event<reshade::addon_event::bind_pipeline>(&on_bind_pipeline);
+	reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(&on_bind_render_targets);
+	reshade::register_event<reshade::addon_event::draw>(&on_draw);
+	reshade::register_event<reshade::addon_event::draw_indexed>(&on_draw_indexed);
+	reshade::register_event<reshade::addon_event::draw_or_dispatch_indirect>(&on_draw_indirect);
+	reshade::register_event<reshade::addon_event::copy_resource>(&on_copy_resource);
+	reshade::register_event<reshade::addon_event::copy_texture_region>(&on_copy_texture_region);
 	reshade::register_event<reshade::addon_event::reshade_overlay>(&on_reshade_overlay);
 	reshade::register_overlay("DLSS Forge", &draw_overlay);
 	return true;
@@ -1526,13 +2013,24 @@ extern "C" __declspec(dllexport) void AddonUninit(HMODULE module, HMODULE reshad
 	forge::ngx_hook::stop_motion_capture();
 	reshade::unregister_overlay("DLSS Forge", &draw_overlay);
 	reshade::unregister_event<reshade::addon_event::reshade_overlay>(&on_reshade_overlay);
+	reshade::unregister_event<reshade::addon_event::copy_texture_region>(&on_copy_texture_region);
+	reshade::unregister_event<reshade::addon_event::copy_resource>(&on_copy_resource);
+	reshade::unregister_event<reshade::addon_event::draw_or_dispatch_indirect>(&on_draw_indirect);
+	reshade::unregister_event<reshade::addon_event::draw_indexed>(&on_draw_indexed);
+	reshade::unregister_event<reshade::addon_event::draw>(&on_draw);
+	reshade::unregister_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(&on_bind_render_targets);
+	reshade::unregister_event<reshade::addon_event::bind_pipeline>(&on_bind_pipeline);
+	reshade::unregister_event<reshade::addon_event::destroy_pipeline>(&on_destroy_pipeline);
 	reshade::unregister_event<reshade::addon_event::init_pipeline>(&on_init_pipeline);
 	reshade::unregister_event<reshade::addon_event::destroy_command_queue>(&on_destroy_command_queue);
 	reshade::unregister_event<reshade::addon_event::init_command_queue>(&on_init_command_queue);
 	reshade::unregister_event<reshade::addon_event::destroy_device>(&on_destroy_device);
 	reshade::unregister_event<reshade::addon_event::present>(&on_present);
+	reshade::unregister_event<reshade::addon_event::reshade_begin_effects>(&on_begin_effects);
+	reshade::unregister_event<reshade::addon_event::reshade_render_technique>(&on_render_technique);
 	reshade::unregister_event<reshade::addon_event::reshade_finish_effects>(&on_finish_effects);
 	reshade::unregister_event<reshade::addon_event::reshade_present>(&on_reshade_present);
+	reshade::unregister_event<reshade::addon_event::destroy_effect_runtime>(&on_destroy_effect_runtime);
 	reshade::unregister_event<reshade::addon_event::init_effect_runtime>(&on_init_effect_runtime);
 	reshade::unregister_event<reshade::addon_event::init_swapchain>(&on_init_swapchain);
 	forge::desktop::release();

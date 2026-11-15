@@ -4,6 +4,7 @@
 #include "motion_diagnostics.h"
 #include "nr_bridge.h"
 #include "settings.h"
+#include <d3d11_4.h>
 #include <atomic>
 #include <cmath>
 #include <cstdarg>
@@ -93,10 +94,18 @@ namespace
 	std::vector<std::unique_ptr<feature_record>> g_features;
 	Parameter *g_own_params = nullptr;
 	bool g_logged_untracked = false;
-	bool g_nr_on = false; // the NR bridge holds resources for the game's frame
+	std::atomic<bool> g_nr_on { false }; // the NR bridge holds resources for the game's frame
 
 	// No reference is held: the context belongs to the game's device, and ReShade clears it before that device goes.
 	std::atomic<ID3D11DeviceContext *> g_native_ctx { nullptr };
+
+	// ReShade effects against the DLSS evaluate in the immediate context's order (see effects_on_queue)
+	std::atomic<uint64_t> g_eval_serial { 0 };          // DLSS evaluations of tracked features
+	std::atomic<DWORD> g_eval_thread { 0 };             // the game's render thread, which evaluates DLSS
+	std::atomic<bool> g_effects_this_frame { false };   // effects reached the immediate context since the last present
+	std::atomic<bool> g_effects_before_eval { false };  // and a DLSS evaluate followed them in this frame
+	std::atomic<uint64_t> g_effects_input_tick { 0 };    // last frame that had effects in the DLSS input
+	bool g_effects_input_logged = false;
 
 	// The native immediate context for the game's immediate context; any other context stays as it is.
 	ID3D11DeviceContext *unwrap(ID3D11DeviceContext *ctx)
@@ -424,7 +433,7 @@ namespace
 		if (at == forge::nr::stage::after_upscaling && position == forge::nr::stage::before_upscaling) return false;
 		if (!dlss_ok)
 		{
-			forge::nr::invalidate();
+			forge::nr::invalidate(g_eval_serial.load(std::memory_order_relaxed));
 			return false;
 		}
 
@@ -477,10 +486,10 @@ namespace
 				f.w, f.h, f.x, f.y, f.guide_w, f.guide_h, f.depth_x, f.depth_y, f.motion_x, f.motion_y, f.mv_scale_x, f.mv_scale_y,
 				f.depth_inverted ? "inverted" : "not inverted", f.hdr ? "HDR" : "display-referred");
 		}
+		f.serial = g_eval_serial.load(std::memory_order_relaxed);
 		if (position == forge::nr::stage::present)
 		{
 			if (!s.nr.temporal) f.motion = nullptr;
-			if (!s.nr.mask.enabled) f.depth = nullptr;
 			forge::nr::capture_present(f);
 			return true;
 		}
@@ -737,6 +746,8 @@ namespace
 		if (real == nullptr)
 			return result_fail;
 		Parameter *p = const_cast<Parameter *>(cp);
+		if (g_effects_this_frame.load(std::memory_order_relaxed))
+			g_effects_before_eval.store(true, std::memory_order_relaxed);
 
 		AcquireSRWLockExclusive(&g_feature_lock);
 		feature_record *rec = find(h);
@@ -751,6 +762,8 @@ namespace
 			return real(ctx, h, cp, cb);
 		}
 
+		g_eval_serial.fetch_add(1, std::memory_order_relaxed);
+		g_eval_thread.store(GetCurrentThreadId(), std::memory_order_relaxed);
 		// The context the feature was created on; NR and re-created features follow it
 		ID3D11DeviceContext *const run = rec->native ? unwrap(ctx) : ctx;
 		const forge::settings s = forge::get_settings();
@@ -823,7 +836,7 @@ namespace
 		std::memcpy(rec->nr_display, display, sizeof(display));
 		const Result res = real(run, rec->live(), p, cb);
 		if (capturing) forge::motion_diagnostics::after_sr(unwrap(run), res, game_reset != 0 || touched_reset);
-		if (!succeeded(res)) forge::nr::invalidate();
+		if (!succeeded(res)) forge::nr::invalidate(g_eval_serial.load(std::memory_order_relaxed));
 		if (touched_reset)
 			set_i(p, name::reset, game_reset);
 		{
@@ -1044,16 +1057,127 @@ namespace
 	}
 }
 
+void forge::ngx_hook::effects_on_queue()
+{
+	g_effects_this_frame.store(true, std::memory_order_relaxed);
+}
+
+void forge::ngx_hook::end_effects_frame()
+{
+	const bool input = g_effects_before_eval.exchange(false, std::memory_order_relaxed);
+	g_effects_this_frame.store(false, std::memory_order_relaxed);
+	const uint64_t now = GetTickCount64();
+	if (input)
+		g_effects_input_tick.store(now, std::memory_order_relaxed);
+	// One log line per change of the last second's state: deferred recording can alternate it between frames
+	const uint64_t last = g_effects_input_tick.load(std::memory_order_relaxed);
+	const bool recent = last != 0 && now - last < 1000;
+	if (recent != g_effects_input_logged)
+	{
+		g_effects_input_logged = recent;
+		FORGE_LOG(recent ? "ReShade effects reach the DLSS input: an add-on renders them before the DLSS evaluate"
+			: "ReShade effects follow the DLSS evaluate");
+	}
+}
+
+uint64_t forge::ngx_hook::effects_in_dlss_input()
+{
+	return g_effects_input_tick.load(std::memory_order_relaxed);
+}
+
+namespace
+{
+	// Present-thread entry. ReShade holds the immediate context's multithread lock (ID3D11Multithread::Enter with
+	// protection on) through the present callbacks and its effect pass, and the render thread takes g_feature_lock
+	// ahead of its own context calls. Waiting for g_feature_lock with the context lock released gives both threads one
+	// lock order: g_feature_lock, then the context.
+	struct present_lock
+	{
+		explicit present_lock(ID3D11DeviceContext *ctx)
+		{
+			if (TryAcquireSRWLockExclusive(&g_feature_lock))
+				return;
+			ID3D11Multithread *mt = nullptr;
+			if (ctx != nullptr && SUCCEEDED(unwrap(ctx)->QueryInterface(__uuidof(ID3D11Multithread), reinterpret_cast<void **>(&mt))) &&
+				mt != nullptr && !mt->GetMultithreadProtected())
+			{
+				mt->Release();
+				mt = nullptr;
+			}
+			if (mt != nullptr)
+				mt->Leave();
+			AcquireSRWLockExclusive(&g_feature_lock);
+			if (mt != nullptr)
+			{
+				mt->Enter();
+				mt->Release();
+			}
+		}
+		~present_lock() { ReleaseSRWLockExclusive(&g_feature_lock); }
+	};
+
+	// With g_feature_lock held: the model goes when DLSS 5 is off; true while the Present stage runs
+	bool present_stage_locked(const forge::settings &s)
+	{
+		if (!s.enabled || s.guest_mode || !s.nr.enabled)
+		{
+			if (g_nr_on) forge::nr::release();
+			g_nr_on = false;
+			return false;
+		}
+		return s.nr.selected_stage() == forge::nr::stage::present;
+	}
+}
+
+bool forge::ngx_hook::present_stage_selected()
+{
+	const forge::settings s = forge::get_settings();
+	return s.enabled && !s.guest_mode && s.nr.enabled && s.nr.selected_stage() == forge::nr::stage::present;
+}
+
+void forge::ngx_hook::present_frame(ID3D11DeviceContext *ctx, ID3D11Resource *image, bool run_model, bool linear_hdr,
+	uint64_t frame_serial, bool diagnostics, unsigned int color_space)
+{
+	const forge::settings s = forge::get_settings();
+	const bool off = !s.enabled || s.guest_mode || !s.nr.enabled;
+	diagnostics = diagnostics && (s.motion_capture || forge::motion_diagnostics::active());
+	if (!run_model && !diagnostics && !(off && g_nr_on.load(std::memory_order_relaxed)))
+		return;
+	present_lock lock(ctx);
+	if (present_stage_locked(s) && run_model)
+	{
+		g_nr_on = true;
+		forge::nr::run_present(unwrap(ctx), image, s.nr, linear_hdr, frame_serial);
+	}
+	if (diagnostics)
+		forge::motion_diagnostics::present(unwrap(ctx), s, image, color_space);
+}
+
+void forge::ngx_hook::run_before_ui(ID3D11DeviceContext *ctx, ID3D11Resource *image, bool linear_hdr, uint64_t frame_serial)
+{
+	lock_guard lock(g_feature_lock);
+	const forge::settings s = forge::get_settings();
+	if (!present_stage_locked(s))
+		return;
+	g_nr_on = true;
+	forge::nr::run_present(unwrap(ctx), image, s.nr, linear_hdr, frame_serial);
+}
+
+uint64_t forge::ngx_hook::evaluation_serial()
+{
+	return g_eval_serial.load(std::memory_order_relaxed);
+}
+
+DWORD forge::ngx_hook::evaluate_thread()
+{
+	return g_eval_thread.load(std::memory_order_relaxed);
+}
+
 void forge::ngx_hook::present_nr(ID3D11DeviceContext *ctx, ID3D11Resource *back_buffer, bool linear_hdr, unsigned int color_space)
 {
 	lock_guard lock(g_feature_lock);
 	const forge::settings s = forge::get_settings();
-	if (!s.enabled || s.guest_mode || !s.nr.enabled)
-	{
-		if (g_nr_on) forge::nr::release();
-		g_nr_on = false;
-	}
-	else if (s.nr.selected_stage() == forge::nr::stage::present)
+	if (present_stage_locked(s))
 	{
 		g_nr_on = true;
 		forge::nr::run_present(unwrap(ctx), back_buffer, s.nr, linear_hdr);
@@ -1069,7 +1193,7 @@ ID3D11DeviceContext *forge::ngx_hook::native_context(ID3D11DeviceContext *ctx)
 
 void forge::ngx_hook::capture_after_effects(ID3D11DeviceContext *ctx, ID3D11Resource *image)
 {
-	lock_guard lock(g_feature_lock);
+	present_lock lock(ctx);
 	forge::motion_diagnostics::after_effects(unwrap(ctx), image);
 }
 
